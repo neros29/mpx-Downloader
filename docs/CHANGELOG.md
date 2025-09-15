@@ -52,4 +52,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - API documentation in code
 - Example configurations and batch files
 
-[1.0.0]: https://github.com/yourusername/yt-dlp-wrapper/releases/tag/v1.0.0
+[1.0.0]: https://github.com/neros29/mpx-Downloader/releases/tag/v1.0.0

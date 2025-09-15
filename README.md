@@ -32,8 +32,8 @@ An advanced, user-friendly wrapper for yt-dlp with smart features for downloadin
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/yt-dlp-wrapper.git
-   cd yt-dlp-wrapper
+   git clone https://github.com/neros29/mpx-Downloader.git
+   cd mpx-Downloader
    ```
 
 2. Install dependencies:
@@ -235,9 +235,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🐛 Issues & Support
 
-- 🐛 [Report Bugs](https://github.com/yourusername/yt-dlp-wrapper/issues)
-- 💡 [Request Features](https://github.com/yourusername/yt-dlp-wrapper/issues)
-- 📖 [Documentation](https://github.com/yourusername/yt-dlp-wrapper/wiki)
+- 🐛 [Report Bugs](https://github.com/neros29/mpx-Downloader/issues)
+- 💡 [Request Features](https://github.com/neros29/mpx-Downloader/issues)
+- 📖 [Documentation](https://github.com/neros29/mpx-Downloader/wiki)
 
 ## 📊 Archive Location
 

@@ -7,13 +7,13 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
     requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
 
 setup(
-    name="yt-dlp-wrapper",
+    name="mpx-downloader",
     version="1.0.0",
-    author="Soren",
+    author="neros29",
     description="An advanced, user-friendly wrapper for yt-dlp with smart features",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/yt-dlp-wrapper",
+    url="https://github.com/neros29/mpx-Downloader",
     py_modules=["download"],
     classifiers=[
         "Development Status :: 5 - Production/Stable",
@@ -33,13 +33,13 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "yt-dlp-wrapper=download:main",
+            "mpx-downloader=download:main",
         ],
     },
     keywords="youtube downloader yt-dlp wrapper audio video mp3 mp4 mkv",
     project_urls={
-        "Bug Reports": "https://github.com/yourusername/yt-dlp-wrapper/issues",
-        "Source": "https://github.com/yourusername/yt-dlp-wrapper",
-        "Documentation": "https://github.com/yourusername/yt-dlp-wrapper/wiki",
+        "Bug Reports": "https://github.com/neros29/mpx-Downloader/issues",
+        "Source": "https://github.com/neros29/mpx-Downloader",
+        "Documentation": "https://github.com/neros29/mpx-Downloader/wiki",
     },
 )
