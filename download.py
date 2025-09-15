@@ -615,9 +615,20 @@ def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str
 	for url in urls:
 		print(C_HEAD + f"\n➡ Processing: {url}" + C_RESET)
 		
+		info = None
+		is_playlist = False
+		
 		try:
+			# Set up temporary extractor with cookies if needed
+			temp_opts: dict = {"quiet": True, "no_warnings": True}
+			
+			# Check if we need Firefox cookies for this URL
+			use_cookies_for_info = force_firefox_cookies or is_youtube_music_liked(url)
+			if use_cookies_for_info:
+				temp_opts["cookiesfrombrowser"] = ("firefox", None, None, None)
+			
 			# First, extract info to determine if it's a playlist and get metadata
-			temp_ydl = YoutubeDL({"quiet": True, "no_warnings": True})
+			temp_ydl = YoutubeDL(temp_opts)
 			info = temp_ydl.extract_info(url, download=False)
 			
 			# Determine if this is a playlist
@@ -632,20 +643,41 @@ def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str
 			
 		except Exception as e:
 			print(C_WARN + f"Warning: Could not extract initial info: {e}" + C_RESET)
-			# Fallback to basic options
+			# Fallback to basic options, but still try to detect playlist from URL patterns
 			try:
-				opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies, fast_mode, url)
+				# Make educated guess about playlist status from URL
+				is_playlist = ("playlist" in url.lower() or "list=" in url)
+				
+				# For known playlist URLs like LM, create a mock info dict
+				if is_playlist:
+					mock_info = None
+					if "list=LM" in url or (url.lower().find("music.youtube.com") != -1 and "liked" in url.lower()):
+						mock_info = {
+							"_type": "playlist",
+							"playlist_title": "Liked Music",
+							"entries": []
+						}
+						print(f"  🎵 {C_HEAD}Detected playlist:{C_RESET} Liked Music (using URL pattern)")
+					
+					opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies, fast_mode, url, mock_info)
+				else:
+					opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies, fast_mode, url)
 			except Exception as e2:
 				print(C_ERR + f"Error setting up download options: {e2}" + C_RESET)
 				continue
-			info = None
-			is_playlist = False
 		
 		# Use our custom YoutubeDL class that uses JSON archive and copies files
 		with SmartYoutubeDL(opts, base_dir, container, url) as ydl:
 			# Set playlist info if available
 			if info and is_playlist:
 				ydl._playlist_info = info
+			elif is_playlist and "list=LM" in url:
+				# Set mock info for Liked Music
+				ydl._playlist_info = {
+					"_type": "playlist",
+					"playlist_title": "Liked Music",
+					"entries": []
+				}
 			
 			try:
 				# Auto-use cookies if it's a YT Music Liked URL
@@ -684,12 +716,14 @@ def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str
 					print(C_WARN + f"⚠ Download completed with warnings for: {url}" + C_RESET)
 					
 				# Generate M3U for playlists
-				if info and is_playlist:
+				if is_playlist:
 					try:
 						# Determine the correct output directory for M3U
-						playlist_dir = create_playlist_folder(base_dir, url, info)
-						generate_m3u_for_playlist(info, playlist_dir, container)
-						print(f"    🎼 {C_DIM}Generated M3U playlist file{C_RESET}")
+						playlist_folder_name = get_playlist_folder_name(url, info)
+						playlist_dir = base_dir / playlist_folder_name
+						if playlist_dir.exists():
+							generate_m3u_for_playlist(info or {"playlist_title": playlist_folder_name, "entries": []}, playlist_dir, container)
+							print(f"    🎼 {C_DIM}Generated M3U playlist file{C_RESET}")
 					except Exception as e:
 						print(C_DIM + f"Note: Could not generate M3U file: {e}" + C_RESET)
 					
