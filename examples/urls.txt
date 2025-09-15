@@ -1,0 +1,17 @@
+# Example URLs for testing
+# Lines starting with # are comments and will be ignored
+
+# Single video
+https://youtube.com/watch?v=dQw4w9WgXcQ
+
+# Playlist
+https://youtube.com/playlist?list=PLrHSFWWP_8J6M0_9KHfp5h8VqfPBkGLBN
+
+# Channel (will download all videos)
+https://youtube.com/@examplechannel
+
+# Music video
+https://youtube.com/watch?v=fJ9rUzIMcZQ
+
+# Another playlist
+https://youtube.com/playlist?list=PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI
