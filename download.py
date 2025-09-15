@@ -242,7 +242,9 @@ def copy_from_archive(archive_entry: dict, target_dir: Path, container: str) -> 
 		
 		# Copy the file
 		shutil.copy2(source_path, target_path)
-		print(f"    📋 {C_OK}Copied from archive:{C_RESET} {target_path.name}")
+		print(f"    📋 {C_OK}Copied from archive (not downloaded):{C_RESET} {target_path.name}")
+		print(f"      {C_DIM}Source: {source_path}{C_RESET}")
+		print(f"      {C_DIM}Target: {target_path}{C_RESET}")
 		return True
 		
 	except Exception as e:
@@ -430,7 +432,8 @@ class SmartYoutubeDL(YoutubeDL):
 				# Check if we have this in our archive for the specific format
 				archive_entry = find_in_archive(video_id, extractor, self.container)
 				if archive_entry:
-					print(f"  📋 {C_OK}Found in archive:{C_RESET} {title}")
+					print(f"  📋 {C_OK}Found in archive - skipping download:{C_RESET} {title}")
+					print(f"    {C_DIM}Archive location: {archive_entry['file_path']}{C_RESET}")
 					# Try to copy from archive
 					# Determine target directory (playlist folder if applicable)
 					target_dir = self.base_dir
@@ -441,7 +444,7 @@ class SmartYoutubeDL(YoutubeDL):
 						self.copied_count += 1
 						return None  # Skip downloading
 					else:
-						print(f"  ⚠️  {C_WARN}Archive copy failed, will re-download{C_RESET}")
+						print(f"    ⚠️  {C_WARN}Archive copy failed, will re-download{C_RESET}")
 				
 				# Check if file already exists in current directory
 				target_dir = self.base_dir
@@ -449,7 +452,7 @@ class SmartYoutubeDL(YoutubeDL):
 					target_dir = create_playlist_folder(self.base_dir, self.url, self._playlist_info)
 				
 				if check_existing_file(target_dir, info_dict, self.container):
-					print(f"  ⏭️  {C_DIM}Skipping (already exists):{C_RESET} {title}")
+					print(f"  ⏭️  {C_DIM}Skipping (file already exists locally):{C_RESET} {title}")
 					self.skipped_count += 1
 					return None  # Skip this video
 		
@@ -698,16 +701,24 @@ def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str
 				
 				print(f"\n  📈 {C_HEAD}Summary for this URL:{C_RESET}")
 				if ydl.downloaded_count > 0:
-					print(f"    ✅ {C_OK}Downloaded: {ydl.downloaded_count} new file(s){C_RESET}")
+					print(f"    ✅ {C_OK}Downloaded (new files): {ydl.downloaded_count} file(s){C_RESET}")
 				if ydl.copied_count > 0:
-					print(f"    📋 {C_OK}Copied from archive: {ydl.copied_count} file(s){C_RESET}")
+					print(f"    📋 {C_OK}Copied from archive (not downloaded): {ydl.copied_count} file(s){C_RESET}")
 				if ydl.skipped_count > 0:
-					print(f"    ⏭️  {C_DIM}Skipped (already exists): {ydl.skipped_count} file(s){C_RESET}")
+					print(f"    ⏭️  {C_DIM}Skipped (already exists locally): {ydl.skipped_count} file(s){C_RESET}")
 				
 				if total_actions > 0:
 					archive_efficiency = (ydl.copied_count / total_actions) * 100
 					if archive_efficiency > 0:
-						print(f"    🎯 {C_DIM}Archive efficiency: {archive_efficiency:.1f}% (saved {ydl.copied_count} downloads){C_RESET}")
+						print(f"    🎯 {C_DIM}Archive efficiency: {archive_efficiency:.1f}% (avoided {ydl.copied_count} downloads){C_RESET}")
+					download_efficiency = (ydl.skipped_count / total_actions) * 100
+					if download_efficiency > 0:
+						print(f"    💾 {C_DIM}Already had locally: {download_efficiency:.1f}% ({ydl.skipped_count} files){C_RESET}")
+				
+				# Show total bandwidth/time saved
+				total_saved = ydl.copied_count + ydl.skipped_count
+				if total_saved > 0:
+					print(f"    🚀 {C_OK}Total files not downloaded: {total_saved}/{total_actions} ({(total_saved/total_actions)*100:.1f}%){C_RESET}")
 				
 				# ydl.download returns 0 on success
 				if res == 0:
