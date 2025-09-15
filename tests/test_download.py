@@ -109,9 +109,11 @@ class TestDownloadFunctions:
         mock_ydl.download.assert_called_once_with(urls)
         assert result == 1  # One successful download
     
+    @patch('download.build_archive_from_existing_files')
     @patch('download.SmartYoutubeDL')
-    def test_download_urls_youtube_music_auto_cookies(self, mock_ydl_class):
-        """Test automatic cookie enabling for YouTube Music."""
+    def test_download_urls_youtube_music_auto_cookies(self, mock_ydl_class, mock_build_archive):
+        """Test automatic cookie enabling for YouTube Music in immediate mode."""
+        # Mock the SmartYoutubeDL instance used in immediate mode
         mock_ydl = MagicMock()
         mock_ydl.__enter__ = MagicMock(return_value=mock_ydl)
         mock_ydl.__exit__ = MagicMock(return_value=None)
@@ -119,17 +121,57 @@ class TestDownloadFunctions:
         mock_ydl.downloaded_count = 1
         mock_ydl.copied_count = 0
         mock_ydl.skipped_count = 0
-        mock_ydl.extract_info.return_value = {"_type": "video"}
-        mock_ydl.params = {}
         mock_ydl_class.return_value = mock_ydl
         
         # Test with YouTube Music Liked URL
         urls = ["https://music.youtube.com/playlist?list=LM"]
         download.download_urls(urls, self.temp_dir, "mp3", "audio", False)
         
-        # Verify cookies were auto-enabled
-        assert "cookiesfrombrowser" in mock_ydl.params
-        assert mock_ydl.params["cookiesfrombrowser"] == ("firefox", None, None, None)
+        # Verify SmartYoutubeDL was called with options that include cookies
+        mock_ydl_class.assert_called_once()
+        call_args = mock_ydl_class.call_args[0]  # Get positional arguments
+        opts = call_args[0]  # First argument should be the options dict
+        
+        # Verify cookies were auto-enabled in the options
+        assert "cookiesfrombrowser" in opts
+        assert opts["cookiesfrombrowser"] == ("firefox", None, None, None)
+    
+    @patch('download.build_archive_from_existing_files')
+    @patch('download.YoutubeDL')
+    @patch('download.SmartYoutubeDL')
+    def test_download_urls_retry_with_cookies(self, mock_ydl_class, mock_temp_ydl_class, mock_build_archive):
+        """Test automatic retry with cookies when playlist access fails."""
+        # Mock the temporary YoutubeDL for info extraction to fail first
+        mock_temp_ydl = MagicMock()
+        mock_temp_ydl.extract_info.side_effect = Exception("This playlist is private")
+        mock_temp_ydl_class.return_value = mock_temp_ydl
+        
+        # Mock the first SmartYoutubeDL instance to fail
+        mock_ydl_fail = MagicMock()
+        mock_ydl_fail.__enter__ = MagicMock(return_value=mock_ydl_fail)
+        mock_ydl_fail.__exit__ = MagicMock(return_value=None)
+        mock_ydl_fail.download.side_effect = Exception("This playlist is private")
+        
+        # Mock the retry SmartYoutubeDL instance to succeed
+        mock_ydl_success = MagicMock()
+        mock_ydl_success.__enter__ = MagicMock(return_value=mock_ydl_success)
+        mock_ydl_success.__exit__ = MagicMock(return_value=None)
+        mock_ydl_success.download.return_value = 0
+        mock_ydl_success.downloaded_count = 1
+        mock_ydl_success.copied_count = 0
+        mock_ydl_success.skipped_count = 0
+        
+        # Set up mock to return failing instance first, then success instance
+        mock_ydl_class.side_effect = [mock_ydl_fail, mock_ydl_success]
+        
+        # Test with a private playlist URL
+        urls = ["https://youtube.com/playlist?list=PLprivate123"]
+        result = download.download_urls(urls, self.temp_dir, "mp3", "audio", False)
+        
+        # Verify that both instances were created (original + retry)
+        assert mock_ydl_class.call_count == 2
+        # Verify the retry succeeded
+        assert result == 1
     
     def test_ydl_opts_common_audio(self):
         """Test yt-dlp options for audio downloads."""
@@ -188,16 +230,19 @@ class TestSmartYoutubeDL:
         if self.temp_dir.exists():
             shutil.rmtree(self.temp_dir)
     
-    @patch('download.find_in_archive')
     @patch('download.copy_from_archive')
-    def test_process_info_copy_from_archive(self, mock_copy, mock_find):
+    def test_process_info_copy_from_archive(self, mock_copy):
         """Test copying file from archive instead of downloading."""
         # Setup mocks
-        mock_find.return_value = {"file_path": "/path/to/file.mp3"}
         mock_copy.return_value = True
         
-        # Create SmartYoutubeDL instance
+        # Create SmartYoutubeDL instance with a mocked archive manager
         ydl = download.SmartYoutubeDL({}, self.temp_dir, "mp3")
+        
+        # Mock the archive manager's find method
+        from unittest.mock import MagicMock
+        mock_archive_entry = {"file_path": "/path/to/file.mp3"}
+        ydl.archive.find = MagicMock(return_value=mock_archive_entry)
         
         # Test info dict
         info_dict = {
@@ -212,7 +257,7 @@ class TestSmartYoutubeDL:
         # Should return None (skip download) and increment copied count
         assert result is None
         assert ydl.copied_count == 1
-        mock_find.assert_called_once_with("abc123", "Youtube", "mp3")
+        ydl.archive.find.assert_called_once_with("abc123", "Youtube", "mp3", "Test Video")
         mock_copy.assert_called_once()
     
     @patch('download.check_existing_file')

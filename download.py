@@ -30,6 +30,266 @@ except Exception as e:  # pragma: no cover
 	print("  pip install -U yt-dlp")
 	sys.exit(1)
 
+
+def get_appdata_archive_path() -> Path:
+	"""Get the path to the JSON archive file in platform-appropriate directory."""
+	if os.name == 'nt':  # Windows
+		appdata = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
+		archive_dir = appdata / 'yt-dlp-wrapper'
+	else:  # Linux/macOS
+		# Use XDG Base Directory specification
+		xdg_data_home = os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share')
+		archive_dir = Path(xdg_data_home) / 'yt-dlp-wrapper'
+	
+	archive_dir.mkdir(parents=True, exist_ok=True)
+	return archive_dir / 'download_archive.json'
+
+
+class ArchiveManager:
+	"""Cached archive manager to avoid per-item JSON reads/writes."""
+	
+	def __init__(self):
+		self._path = get_appdata_archive_path()
+		try:
+			self.data = json.loads(self._path.read_text(encoding="utf-8"))
+		except Exception:
+			self.data = {}
+		self._dirty = False
+	
+	def save(self):
+		"""Save the archive if it has been modified."""
+		if self._dirty:
+			try:
+				self._path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+				self._dirty = False
+			except Exception as e:
+				print(f"    {C_WARN}Warning: Could not save archive: {e}{C_RESET}")
+	
+	def key(self, vid: str, extractor: str, container: str) -> str:
+		"""Generate a consistent key for archive entries."""
+		return f"{(extractor or 'generic').lower()}_{vid}_{container}"
+	
+	def find(self, vid: str, extractor: str, container: str, title: str | None = None) -> dict | None:
+		"""Find a video in the archive, with title fallback if no exact match."""
+		k = self.key(vid, extractor, container)
+		
+		# First try exact key match
+		if k in self.data:
+			p = Path(self.data[k]["file_path"])
+			if p.exists():
+				return self.data[k]
+			# File no longer exists, remove from archive
+			del self.data[k]
+			self._dirty = True
+		
+		# Title-based fallback search
+		if title:
+			clean = sanitize_filename(title, restricted=False).lower()
+			keys_to_remove = []
+			
+			for kk, v in list(self.data.items()):
+				if kk.endswith(f"_{container}"):
+					p = Path(v["file_path"])
+					if not p.exists():
+						keys_to_remove.append(kk)
+						continue
+					
+					if sanitize_filename(v.get("title", ""), restricted=False).lower() == clean:
+						# Clean up missing files we found along the way
+						for key_to_remove in keys_to_remove:
+							del self.data[key_to_remove]
+						if keys_to_remove:
+							self._dirty = True
+						return v
+			
+			# Clean up any missing files we found
+			for key_to_remove in keys_to_remove:
+				del self.data[key_to_remove]
+			if keys_to_remove:
+				self._dirty = True
+		
+		return None
+	
+	def add(self, vid: str, extractor: str, title: str, file_path: Path, container: str):
+		"""Add a new entry to the archive."""
+		k = self.key(vid, extractor, container)
+		self.data[k] = {
+			"id": vid,
+			"extractor": extractor,
+			"title": title,
+			"format": container,
+			"file_path": str(file_path),
+			"download_date": file_path.stat().st_mtime if file_path.exists() else 0.0
+		}
+		self._dirty = True
+	
+	# Make ArchiveManager compatible with yt-dlp's archive expectations
+	def __contains__(self, key):
+		"""Support 'key in archive' checks from yt-dlp."""
+		return key in self.data
+	
+	def __iter__(self):
+		"""Support iteration over archive keys."""
+		return iter(self.data)
+	
+	def keys(self):
+		"""Return archive keys."""
+		return self.data.keys()
+
+
+def flat_entries(url: str, use_cookies: bool) -> list[dict]:
+	"""Extract flat playlist entries (IDs + titles only) without heavy extractor work."""
+	opts = {
+		"extract_flat": True,         # <- no per-item player probing
+		"dump_single_json": True,
+		"quiet": True,
+		"logger": _YDLLogger(),
+		"socket_timeout": 15,
+		"extractor_retries": 3,
+	}
+	if use_cookies:
+		opts["cookiesfrombrowser"] = ("firefox", None, None, None)
+	
+	try:
+		with YoutubeDL(opts) as ydl:
+			info = ydl.extract_info(url, download=False)
+		return (info.get("entries") if info else []) or []
+	except Exception as e:
+		print(f"    {C_WARN}Warning: Could not extract flat entries: {e}{C_RESET}")
+		return []
+
+
+def fast_copy_from_archive(url: str, base_dir: Path, container: str, archive_mgr: ArchiveManager) -> list[str]:
+	"""Fast prepass: copy everything from archive, return missing IDs for download."""
+	entries = flat_entries(url, use_cookies=is_youtube_music_liked(url))
+	if not entries:
+		return []
+	
+	# Create playlist folder
+	if is_youtube_music_liked(url):
+		playlist_dir = base_dir / "Liked Music"
+	else:
+		# Try to get playlist title from flat extraction
+		playlist_title = "Playlist"  # fallback
+		try:
+			# Extract basic info to get playlist title
+			temp_opts = {"quiet": True, "logger": _YDLLogger()}
+			if is_youtube_music_liked(url):
+				temp_opts["cookiesfrombrowser"] = ("firefox", None, None, None)
+			
+			with YoutubeDL(temp_opts) as ydl:
+				info = ydl.extract_info(url, download=False)
+				if info:
+					playlist_title = info.get("playlist_title") or info.get("playlist") or playlist_title
+		except Exception:
+			pass
+		
+		playlist_dir = base_dir / sanitize_filename(playlist_title, restricted=False)
+	
+	playlist_dir.mkdir(parents=True, exist_ok=True)
+	
+	missing_ids = []
+	copied_count = 0
+	
+	for e in entries:
+		vid = e.get("id")
+		title = e.get("title") or "unknown"
+		if not vid:
+			continue
+		
+		entry = archive_mgr.find(vid, e.get("extractor_key") or "YouTube", container, title)
+		if entry:
+			if optimized_copy_from_archive(entry, playlist_dir, container):
+				copied_count += 1
+		else:
+			missing_ids.append(vid)
+	
+	if copied_count > 0:
+		print(f"  📋 {C_OK}Copied {copied_count} files from archive{C_RESET}")
+	
+	if missing_ids:
+		print(f"  📥 {C_DIM}Need to download {len(missing_ids)} new files{C_RESET}")
+	
+	return missing_ids
+
+
+def optimized_copy_from_archive(archive_entry: dict, target_dir: Path, container: str) -> bool:
+	"""Copy with hardlink optimization for same-volume files."""
+	try:
+		source_path = Path(archive_entry['file_path'])
+		if not source_path.exists():
+			return False
+		
+		# Determine target filename
+		title = archive_entry['title']
+		clean_title = sanitize_filename(title, restricted=False)
+		
+		# Determine extension based on format and source file
+		if container in ("mp3", "native"):
+			if container == "mp3":
+				target_ext = ".mp3" if source_path.suffix.lower() == ".mp3" else source_path.suffix
+			else:  # native
+				target_ext = source_path.suffix
+		else:
+			target_ext = source_path.suffix or f".{container}"
+		
+		target_path = target_dir / f"{clean_title}{target_ext}"
+		
+		# Avoid copying to the same location
+		if source_path.resolve() == target_path.resolve():
+			return True
+		
+		# Try hardlink first (fast path on same volume)
+		try:
+			os.link(source_path, target_path)  # Windows supports this on NTFS
+			print(f"    📎 {C_OK}Hardlinked from archive:{C_RESET} {target_path.name}")
+		except Exception:
+			# Fallback to copy if hardlink fails (different volumes, etc.)
+			shutil.copy2(source_path, target_path)
+			print(f"    📋 {C_OK}Copied from archive:{C_RESET} {target_path.name}")
+		
+		print(f"      {C_DIM}Source: {source_path}{C_RESET}")
+		print(f"      {C_DIM}Target: {target_path}{C_RESET}")
+		return True
+		
+	except Exception as e:
+		print(f"    {C_WARN}Warning: Could not copy from archive: {e}{C_RESET}")
+		return False
+
+
+class _YDLLogger:
+	def debug(self, msg): 
+		# Filter super-chatty lines, but keep useful extractor messages
+		low = msg.lower()
+		if any(k in low for k in ("downloading", "extract", "playlist", "continuation", "api", "cookies")):
+			print(f"    {C_DIM}{msg}{C_RESET}")
+	def warning(self, msg): print(f"    {C_WARN}[warn] {msg}{C_RESET}")
+	def error(self, msg):   print(f"    {C_ERR}[err ] {msg}{C_RESET}")
+
+
+class Heartbeat:
+	def __init__(self, label: str = "working…", interval: float = 2.0):
+		self.label, self.interval, self._stop = label, interval, False
+		
+	def start(self):
+		def run():
+			import threading, time
+			i = 0
+			while not self._stop:
+				i = (i + 1) % 4
+				dots = "." * i + " " * (3 - i)
+				print(f"\r  {self.label} {dots}", end="", flush=True)
+				time.sleep(self.interval)
+			print("\r" + " " * 40 + "\r", end="")
+		import threading
+		self._thr = threading.Thread(target=run, daemon=True)
+		self._thr.start()
+		
+	def stop(self):
+		self._stop = True
+		if hasattr(self, "_thr"): 
+			self._thr.join(timeout=0.2)
+
 # Optional: color support
 try:
 	from colorama import Fore, Style, init as colorama_init
@@ -74,9 +334,130 @@ def detect_ffmpeg() -> bool:
 
 def is_youtube_music_liked(url: str) -> bool:
 	u = url.lower()
-	if "music.youtube.com" in u and ("list=lm" in u or "liked" in u):
-		return True
-	return False
+	return ("music.youtube.com" in u) and ("list=lm" in u or "liked" in u)
+
+
+def outtmpl_for_unknown_playlist(base_dir: Path) -> str:
+	"""Output template that works before we know playlist metadata."""
+	# Let yt-dlp resolve folder name lazily; LM gets a fixed folder.
+	return str(base_dir / "%(playlist_title|playlist|uploader|channel|id)s" / "%(title)s.%(ext)s")
+
+
+def download_immediate(urls: list[str], base_dir: Path, container: str, fmt_type: str, fast_mode: bool = False) -> int:
+	"""Download URLs immediately with fast copy prepass optimization."""
+	print(f"  🚀 {C_OK}Starting optimized download mode (with fast copy prepass)...{C_RESET}")
+	
+	# Initialize archive manager once
+	archive_mgr = ArchiveManager()
+	
+	# Common opts
+	opts = ydl_opts_common(base_dir, container, fmt_type, False, fast_mode)
+	opts.update({
+		"lazy_playlist": True,         # fetch + download page-by-page
+		"playlistreverse": False,
+		"break_on_existing": True,     # Stop early when hitting existing files
+		"break_per_url": True,         # Apply break_on_existing per URL
+		"progress_with_newline": True,
+		"logger": _YDLLogger(),
+		"socket_timeout": 15,
+		"extractor_retries": 3,
+		"noprogress": False,
+	})
+
+	# Output template that works before we know playlist title
+	opts["outtmpl"] = {"default": outtmpl_for_unknown_playlist(base_dir)}
+
+	# If any URL is LM, force Firefox cookies for the real run
+	if any(is_youtube_music_liked(u) for u in urls):
+		print(f"  🍪 {C_OK}Auto-enabling Firefox cookies for Liked Music...{C_RESET}")
+		opts["cookiesfrombrowser"] = ("firefox", None, None, None)
+
+	total_ok = 0
+	
+	# Build archive from existing files in the download directory
+	try:
+		build_archive_from_existing_files_optimized(base_dir, container, archive_mgr)
+	except Exception as e:
+		print(f"    {C_WARN}Warning: Could not build archive from existing files: {e}{C_RESET}")
+
+	for url in urls:
+		print(f"\n{C_HEAD}➡ Processing: {url}{C_RESET}")
+		
+		# Fast copy prepass for playlists
+		if "playlist" in url.lower() or "list=" in url.lower():
+			print(f"  🔍 {C_DIM}Fast copy prepass: checking archive for existing files...{C_RESET}")
+			missing_ids = fast_copy_from_archive(url, base_dir, container, archive_mgr)
+			
+			if not missing_ids:
+				print(f"  ✅ {C_OK}All items satisfied from archive - no downloads needed!{C_RESET}")
+				total_ok += 1
+				continue
+			
+			# Only download the missing items
+			if len(missing_ids) < 50:  # Don't spam for large playlists
+				print(f"  📥 {C_DIM}Downloading {len(missing_ids)} missing items: {', '.join(missing_ids[:10])}{('...' if len(missing_ids) > 10 else '')}{C_RESET}")
+			else:
+				print(f"  📥 {C_DIM}Downloading {len(missing_ids)} missing items{C_RESET}")
+			
+			# Convert missing IDs to full URLs for download
+			real_urls = [f"https://www.youtube.com/watch?v={vid}" for vid in missing_ids]
+		else:
+			# Single video - process normally
+			real_urls = [url]
+		
+		with SmartYoutubeDL(opts, base_dir, container, url, archive_mgr=archive_mgr) as ydl:
+			# Use heartbeat around download to show continuous progress
+			hb = Heartbeat("Processing")
+			try:
+				hb.start()
+				print(f"  📥 {C_OK}Starting download...{C_RESET}")
+				
+				# For playlists with missing items, download only those
+				res = ydl.download(real_urls)
+				
+				if res == 0:
+					total_ok += 1
+					print(f"  ✅ {C_OK}Download completed successfully{C_RESET}")
+				else:
+					print(f"    ⚠ {C_WARN}Download completed with warnings for: {url}{C_RESET}")
+					
+			except KeyboardInterrupt:
+				print(f"\n{C_WARN}Download interrupted by user{C_RESET}")
+				raise
+			except Exception as e:
+				print(f"    ✗ {C_ERR}Error downloading {url}: {e}{C_RESET}")
+				continue
+			finally:
+				hb.stop()
+
+	# Save archive once at the end
+	archive_mgr.save()
+	return total_ok
+
+
+def should_retry_with_cookies(error_message: str, url: str) -> bool:
+	"""Determine if we should retry a failed playlist download with cookies."""
+	# Check if it's a playlist URL and the error suggests authentication issues
+	is_playlist_url = ("playlist" in url.lower() or "list=" in url.lower())
+	if not is_playlist_url:
+		return False
+	
+	# Common error patterns that suggest private/restricted content
+	error_lower = error_message.lower()
+	auth_error_patterns = [
+		"private",
+		"unavailable", 
+		"not available",
+		"requires authentication",
+		"sign in",
+		"403",
+		"forbidden",
+		"restricted",
+		"members-only",
+		"this playlist is private"
+	]
+	
+	return any(pattern in error_lower for pattern in auth_error_patterns)
 
 
 def default_download_dir() -> Path:
@@ -119,40 +500,26 @@ def split_urls(s: str) -> list[str]:
 
 
 def build_outtmpl(base_dir: Path, is_audio: bool, url: str = "", info: dict | None = None) -> str:
-	# Determine if this is a playlist and create appropriate folder structure
+	if is_youtube_music_liked(url):
+		liked_dir = base_dir / "Liked Music"
+		liked_dir.mkdir(parents=True, exist_ok=True)
+		return str(liked_dir / "%(title)s.%(ext)s")
+		
+	# If we already have playlist metadata, pick an explicit folder name now
 	if info and (info.get("_type") == "playlist" or info.get("entries")):
-		# This is a playlist, create a subfolder
-		playlist_dir = create_playlist_folder(base_dir, url, info)
-		out_root = playlist_dir
-	else:
-		# Single video, use base directory
-		out_root = base_dir
-	
-	try:
-		out_root.mkdir(parents=True, exist_ok=True)
-	except PermissionError:
-		print(C_ERR + f"Permission denied: Cannot create directory {out_root}" + C_RESET)
-		raise
-	except Exception as e:
-		print(C_WARN + f"Warning: Could not ensure directory exists: {e}" + C_RESET)
-	
-	# Download directly to the specified folder: <folder>/Title.mp3
-	template = str(out_root / "%(title)s.%(ext)s")
-	return template
+		playlist_dir = base_dir / get_playlist_folder_name(url, info)
+		playlist_dir.mkdir(parents=True, exist_ok=True)
+		return str(playlist_dir / "%(title)s.%(ext)s")
 
+	# If we *suspect* a playlist but don't have info yet, let yt-dlp resolve it
+	if ("playlist" in url.lower() or "list=" in url.lower()) and not info:
+		base_dir.mkdir(parents=True, exist_ok=True)
+		# Use a robust fallthrough so yt-dlp fills whichever it knows
+		return str(base_dir / "%(playlist_title|playlist|uploader|channel|id)s" / "%(title)s.%(ext)s")
 
-def get_appdata_archive_path() -> Path:
-	"""Get the path to the JSON archive file in platform-appropriate directory."""
-	if os.name == 'nt':  # Windows
-		appdata = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
-		archive_dir = appdata / 'yt-dlp-wrapper'
-	else:  # Linux/macOS
-		# Use XDG Base Directory specification
-		xdg_data_home = os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share')
-		archive_dir = Path(xdg_data_home) / 'yt-dlp-wrapper'
-	
-	archive_dir.mkdir(parents=True, exist_ok=True)
-	return archive_dir / 'download_archive.json'
+	# Single item
+	base_dir.mkdir(parents=True, exist_ok=True)
+	return str(base_dir / "%(title)s.%(ext)s")
 
 
 def load_archive() -> dict:
@@ -195,11 +562,12 @@ def add_to_archive(video_id: str, extractor: str, title: str, file_path: Path, c
 	save_archive(archive)
 
 
-def find_in_archive(video_id: str, extractor: str, container: str) -> dict | None:
+def find_in_archive(video_id: str, extractor: str, container: str, title: str | None = None) -> dict | None:
 	"""Find a video in the archive for the specific format and return its info if the file still exists."""
 	archive = load_archive()
 	key = f"{extractor.lower()}_{video_id}_{container}"
 	
+	# First try exact key match
 	if key in archive:
 		entry = archive[key]
 		file_path = Path(entry['file_path'])
@@ -210,46 +578,39 @@ def find_in_archive(video_id: str, extractor: str, container: str) -> dict | Non
 			del archive[key]
 			save_archive(archive)
 	
+	# If no exact match and we have a title, try title-based matching
+	if title:
+		# Clean the title for comparison (same as sanitize_filename does)
+		clean_title = sanitize_filename(title, restricted=False).lower()
+		
+		# Look through all archive entries for this container
+		keys_to_remove = []
+		for arch_key, entry in archive.items():
+			if arch_key.endswith(f"_{container}"):
+				# Check if file still exists
+				file_path = Path(entry['file_path'])
+				if not file_path.exists():
+					keys_to_remove.append(arch_key)
+					continue
+				
+				# Compare titles
+				archived_title = sanitize_filename(entry.get('title', ''), restricted=False).lower()
+				if clean_title == archived_title:
+					# Found a title match!
+					return entry
+		
+		# Clean up any missing files we found
+		if keys_to_remove:
+			for key_to_remove in keys_to_remove:
+				del archive[key_to_remove]
+			save_archive(archive)
+	
 	return None
 
 
 def copy_from_archive(archive_entry: dict, target_dir: Path, container: str) -> bool:
-	"""Copy a file from archive location to target directory."""
-	try:
-		source_path = Path(archive_entry['file_path'])
-		if not source_path.exists():
-			return False
-		
-		# Determine target filename
-		title = archive_entry['title']
-		clean_title = sanitize_filename(title, restricted=False)
-		
-		# Determine extension based on format and source file
-		if container in ("mp3", "native"):
-			# For audio: preserve original extension if not mp3, otherwise use .mp3
-			if container == "mp3":
-				target_ext = ".mp3" if source_path.suffix.lower() == ".mp3" else source_path.suffix
-			else:  # native
-				target_ext = source_path.suffix
-		else:
-			target_ext = source_path.suffix or f".{container}"
-		
-		target_path = target_dir / f"{clean_title}{target_ext}"
-		
-		# Avoid copying to the same location
-		if source_path.resolve() == target_path.resolve():
-			return True
-		
-		# Copy the file
-		shutil.copy2(source_path, target_path)
-		print(f"    📋 {C_OK}Copied from archive (not downloaded):{C_RESET} {target_path.name}")
-		print(f"      {C_DIM}Source: {source_path}{C_RESET}")
-		print(f"      {C_DIM}Target: {target_path}{C_RESET}")
-		return True
-		
-	except Exception as e:
-		print(C_WARN + f"Warning: Could not copy from archive: {e}" + C_RESET)
-		return False
+	"""Copy a file from archive location to target directory (calls optimized version)."""
+	return optimized_copy_from_archive(archive_entry, target_dir, container)
 
 
 def folder_name_from_info(info: dict) -> str:
@@ -259,18 +620,13 @@ def folder_name_from_info(info: dict) -> str:
 
 
 def get_playlist_folder_name(url: str, info: dict | None = None) -> str:
-	"""Get the appropriate folder name for a playlist, with special handling for Liked Music."""
-	# Check if this is a YouTube Music Liked playlist
-	if "list=LM" in url or (url.lower().find("music.youtube.com") != -1 and "liked" in url.lower()):
+	"""Get the appropriate folder name for a playlist."""
+	if is_youtube_music_liked(url):
 		return "Liked Music"
-	
-	# If we have playlist info, use it
 	if info:
-		playlist_title = info.get("playlist_title")
-		if playlist_title:
-			return sanitize_filename(str(playlist_title), restricted=False)
-	
-	# Fallback to generic name
+		name = info.get("playlist_title") or info.get("playlist") \
+		       or info.get("uploader") or info.get("channel") or "Playlist"
+		return sanitize_filename(str(name), restricted=False)
 	return "Playlist"
 
 
@@ -323,11 +679,29 @@ def download_progress_hook(d: dict, base_dir: Path, container: str) -> None:
 				speed_str = f" at {speed/1024/1024:.1f}MB/s"
 			else:
 				speed_str = ""
-			print(f"\r  📥 {percent:.1f}% downloaded{speed_str}", end='', flush=True)
+			print(f"\r    📥 {percent:.1f}% downloaded{speed_str}", end='', flush=True)
+		else:
+			# For streams without known total size
+			downloaded = d.get('downloaded_bytes', 0)
+			speed = d.get('speed', 0)
+			if speed:
+				speed_str = f" at {speed/1024/1024:.1f}MB/s"
+			else:
+				speed_str = ""
+			print(f"\r    📥 {downloaded/1024/1024:.1f}MB downloaded{speed_str}", end='', flush=True)
 	elif d['status'] == 'finished':
-		print(f"\r  ✅ Downloaded: {Path(d['filename']).name}")
+		filename = Path(d['filename']).name
+		print(f"\r    ✅ {C_OK}Downloaded:{C_RESET} {filename}")
 	elif d['status'] == 'error':
-		print(f"\r  ❌ Error downloading: {d.get('filename', 'unknown')}")
+		filename = d.get('filename', 'unknown')
+		print(f"\r    ❌ {C_ERR}Error downloading:{C_RESET} {Path(filename).name if filename != 'unknown' else filename}")
+	elif d['status'] == 'processing':
+		filename = Path(d.get('filename', 'file')).name
+		print(f"    🔄 {C_DIM}Processing:{C_RESET} {filename}")
+	elif d['status'] == 'extracting':
+		print(f"    🔍 {C_DIM}Extracting video information...{C_RESET}")
+	elif d['status'] == 'preparing':
+		print(f"    ⚙️  {C_DIM}Preparing download...{C_RESET}")
 
 
 def should_download_hook(info: dict, base_dir: Path, container: str) -> bool:
@@ -343,6 +717,42 @@ def _stable_key_for_path(abs_path: str, fmt: str) -> str:
 	"""Generate a stable hash-based key for a file path to avoid collisions."""
 	h = hashlib.blake2b(abs_path.encode('utf-8'), digest_size=8).hexdigest()
 	return f"local_{h}_{fmt}"
+
+
+def build_archive_from_existing_files_optimized(download_dir: Path, container: str, archive_mgr: ArchiveManager) -> None:
+	"""Build archive from existing files using the optimized ArchiveManager."""
+	try:
+		# Determine extensions based on format
+		if container == "mp3":
+			extensions = ['.mp3']
+		elif container == "native":
+			extensions = ['.m4a', '.opus', '.webm', '.mp3', '.aac']
+		else:
+			extensions = ['.mp4', '.mkv', '.webm', '.avi']
+		
+		added_count = 0
+		for file_path in download_dir.glob("*"):
+			if file_path.is_file() and file_path.suffix.lower() in extensions:
+				# Generate a stable key for existing files
+				key = _stable_key_for_path(str(file_path.absolute()), container)
+				
+				# Check if already in archive
+				if key not in archive_mgr.data:
+					archive_mgr.data[key] = {
+						'id': file_path.stem,
+						'extractor': 'local',
+						'title': file_path.stem,
+						'format': container,
+						'file_path': str(file_path.absolute()),
+						'download_date': file_path.stat().st_mtime
+					}
+					archive_mgr._dirty = True
+					added_count += 1
+		
+		if added_count > 0:
+			print(f"    📁 {C_DIM}Added {added_count} existing files to archive{C_RESET}")
+	except Exception as e:
+		print(f"    {C_WARN}Warning: Could not build archive from existing files: {e}{C_RESET}")
 
 
 def build_archive_from_existing_files(download_dir: Path, container: str) -> None:
@@ -410,7 +820,7 @@ def generate_m3u_for_playlist(info: dict, download_dir: Path, container: str) ->
 class SmartYoutubeDL(YoutubeDL):
 	"""Custom YoutubeDL class that uses JSON archive and copies existing files."""
 	
-	def __init__(self, params=None, base_dir=None, container=None, url=None):
+	def __init__(self, params=None, base_dir=None, container=None, url=None, archive_mgr=None):
 		super().__init__(params)
 		self.base_dir = base_dir
 		self.container = container
@@ -419,6 +829,18 @@ class SmartYoutubeDL(YoutubeDL):
 		self.downloaded_count = 0
 		self.copied_count = 0
 		self._playlist_info: dict | None = None
+		self.archive = archive_mgr or ArchiveManager()
+	
+	def __exit__(self, *args):
+		"""Ensure archive is saved when context manager exits."""
+		try:
+			# Save the archive
+			self.archive.save()
+		except Exception as e:
+			print(f"    {C_WARN}Warning: Could not save archive on exit: {e}{C_RESET}")
+		
+		# Call parent's exit
+		return super().__exit__(*args)
 	
 	def process_info(self, info_dict):
 		"""Override to add archive checking and copy logic."""
@@ -428,11 +850,14 @@ class SmartYoutubeDL(YoutubeDL):
 			extractor = info_dict.get('extractor_key', info_dict.get('extractor', 'generic'))
 			title = info_dict.get('title', 'unknown')
 			
+			# Show which item we're processing
+			print(f"  🎵 {C_DIM}Processing:{C_RESET} {title}")
+			
 			if video_id and extractor:
 				# Check if we have this in our archive for the specific format
-				archive_entry = find_in_archive(video_id, extractor, self.container)
+				archive_entry = self.archive.find(video_id, extractor, self.container, title)
 				if archive_entry:
-					print(f"  📋 {C_OK}Found in archive - skipping download:{C_RESET} {title}")
+					print(f"    📋 {C_OK}Found in archive - skipping download{C_RESET}")
 					print(f"    {C_DIM}Archive location: {archive_entry['file_path']}{C_RESET}")
 					# Try to copy from archive
 					# Determine target directory (playlist folder if applicable)
@@ -452,9 +877,12 @@ class SmartYoutubeDL(YoutubeDL):
 					target_dir = create_playlist_folder(self.base_dir, self.url, self._playlist_info)
 				
 				if check_existing_file(target_dir, info_dict, self.container):
-					print(f"  ⏭️  {C_DIM}Skipping (file already exists locally):{C_RESET} {title}")
+					print(f"    ⏭️  {C_DIM}Skipping (file already exists locally){C_RESET}")
 					self.skipped_count += 1
 					return None  # Skip this video
+			
+			# If we get here, we need to download
+			print(f"    📥 {C_DIM}Starting download...{C_RESET}")
 		
 		# Process normally (download)
 		result = super().process_info(info_dict)
@@ -463,7 +891,7 @@ class SmartYoutubeDL(YoutubeDL):
 		if result and info_dict.get('_type') != 'playlist':
 			self.downloaded_count += 1
 			title = info_dict.get('title', 'unknown')
-			print(f"  ✅ {C_OK}Downloaded:{C_RESET} {title}")
+			print(f"    ✅ {C_OK}Successfully downloaded{C_RESET}")
 			self._add_successful_download_to_archive(info_dict)
 		
 		return result
@@ -495,9 +923,9 @@ class SmartYoutubeDL(YoutubeDL):
 					file_path = self.base_dir / f"{clean_title}.{self.container}"
 				
 				if file_path and file_path.exists():
-					add_to_archive(video_id, extractor, title, file_path, self.container)
+					self.archive.add(video_id, extractor, title, file_path, self.container)
 		except Exception as e:
-			print(C_DIM + f"Note: Could not add to archive: {e}" + C_RESET)
+			print(f"    {C_DIM}Note: Could not add to archive: {e}{C_RESET}")
 
 
 def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_cookies: bool, fast_mode: bool = False, url: str = "", info: dict | None = None) -> dict:
@@ -515,8 +943,9 @@ def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_c
 		"writeinfojson": False,  # Disable individual JSON files
 		"writethumbnail": not fast_mode,  # Skip thumbnails in fast mode
 		"overwrites": False,
-		"extract_flat": False,  # Don't extract flat for efficient playlist processing
+		"extract_flat": "in_playlist" if ("playlist" in url.lower() or "list=" in url.lower()) else False,  # Reduce per-item overhead for playlists
 		"lazy_playlist": True,  # Enable lazy playlist processing for faster startup
+		"playlistreverse": False,  # Ensure consistent playlist order
 		"progress_hooks": [lambda d: download_progress_hook(d, base_dir, container)],
 		"postprocessor_args": [
 			"-metadata", "comment=Downloaded with yt-dlp wrapper",
@@ -524,6 +953,11 @@ def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_c
 			"-avoid_negative_ts", "make_zero",
 			"-fflags", "+discardcorrupt",
 		],
+		"logger": _YDLLogger(),
+		"socket_timeout": 15,          # don't sit forever on a bad socket
+		"extractor_retries": 3,        # retry different pathways
+		"nocheckcertificate": False,   # leave True only if you *need* it
+		"progress_with_newline": True, # prevents carriage-return lines from hiding output
 	}
 
 	if is_audio:
@@ -607,32 +1041,75 @@ def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_c
 
 
 def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str, force_firefox_cookies: bool, fast_mode: bool = False) -> int:
+	# Check if any URLs are Liked Music - use immediate mode for better streaming
+	liked_music_urls = [url for url in urls if is_youtube_music_liked(url)]
+	regular_urls = [url for url in urls if not is_youtube_music_liked(url)]
+	
 	total_ok = 0
+	
+	# Process Liked Music URLs with immediate mode (no prepass)
+	if liked_music_urls:
+		print(f"\n🎵 {C_HEAD}Processing Liked Music URLs with streaming mode...{C_RESET}")
+		total_ok += download_immediate(liked_music_urls, base_dir, container, fmt_type, fast_mode)
+	
+	# Process regular URLs with the existing logic (with prepass for better folder naming)
+	if regular_urls:
+		if liked_music_urls:
+			print(f"\n📁 {C_HEAD}Processing other URLs with info prepass...{C_RESET}")
+		total_ok += download_urls_with_prepass(regular_urls, base_dir, container, fmt_type, force_firefox_cookies, fast_mode)
+	
+	return total_ok
+
+
+def download_urls_with_prepass(urls: list[str], base_dir: Path, container: str, fmt_type: str, force_firefox_cookies: bool, fast_mode: bool = False) -> int:
+	total_ok = 0
+	
+	# Initialize archive manager once for all URLs
+	archive_mgr = ArchiveManager()
 	
 	# Build archive from existing files in the download directory
 	try:
-		build_archive_from_existing_files(base_dir, container)
+		build_archive_from_existing_files_optimized(base_dir, container, archive_mgr)
 	except Exception as e:
-		print(C_WARN + f"Warning: Could not build archive from existing files: {e}" + C_RESET)
+		print(f"    {C_WARN}Warning: Could not build archive from existing files: {e}{C_RESET}")
 
 	for url in urls:
-		print(C_HEAD + f"\n➡ Processing: {url}" + C_RESET)
+		print(f"\n{C_HEAD}➡ Processing: {url}{C_RESET}")
+		print(f"  🔍 {C_DIM}Extracting playlist information...{C_RESET}")
 		
 		info = None
 		is_playlist = False
 		
 		try:
 			# Set up temporary extractor with cookies if needed
-			temp_opts: dict = {"quiet": True, "no_warnings": True}
+			temp_opts = {
+				"quiet": False,               # <-- turn quiet OFF so we can see progress
+				"no_warnings": False,
+				"logger": _YDLLogger(),
+				"socket_timeout": 15,
+				"extractor_retries": 3,
+			}
 			
 			# Check if we need Firefox cookies for this URL
 			use_cookies_for_info = force_firefox_cookies or is_youtube_music_liked(url)
 			if use_cookies_for_info:
+				print(f"  🍪 {C_DIM}Loading Firefox cookies for authentication...{C_RESET}")
 				temp_opts["cookiesfrombrowser"] = ("firefox", None, None, None)
 			
 			# First, extract info to determine if it's a playlist and get metadata
-			temp_ydl = YoutubeDL(temp_opts)
-			info = temp_ydl.extract_info(url, download=False)
+			print(f"  📊 {C_DIM}Connecting to YouTube Music...{C_RESET}")
+			try:
+				temp_ydl = YoutubeDL(temp_opts)
+				
+				# Add a timeout hint for user
+				print(f"  ⏳ {C_DIM}This may take 10-30 seconds for large playlists...{C_RESET}")
+				
+				info = temp_ydl.extract_info(url, download=False)
+				print(f"  ✅ {C_OK}Successfully extracted playlist information!{C_RESET}")
+				
+			except Exception as extract_error:
+				print(f"  ❌ {C_WARN}Connection failed: {str(extract_error)[:100]}{'...' if len(str(extract_error)) > 100 else ''}{C_RESET}")
+				raise extract_error
 			
 			# Determine if this is a playlist
 			is_playlist = isinstance(info, dict) and (info.get("_type") == "playlist" or info.get("entries"))
@@ -640,37 +1117,36 @@ def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str
 			if is_playlist and info:
 				print(f"  🎵 {C_HEAD}Playlist detected:{C_RESET} {info.get('playlist_title', 'Unknown Playlist')}")
 				print(f"  📊 {C_DIM}Contains {len(info.get('entries', []))} items{C_RESET}")
+				print(f"  📁 {C_DIM}Preparing download folder structure...{C_RESET}")
+			else:
+				print(f"  🎬 {C_HEAD}Single video detected{C_RESET}")
 			
 			# Build options with playlist info
+			print(f"  ⚙️  {C_DIM}Configuring download options...{C_RESET}")
 			opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies, fast_mode, url, info if is_playlist else None)
 			
 		except Exception as e:
-			print(C_WARN + f"Warning: Could not extract initial info: {e}" + C_RESET)
-			# Fallback to basic options, but still try to detect playlist from URL patterns
+			print(f"  ⚠️  {C_WARN}Initial info extraction failed: {e}{C_RESET}")
+			print(f"  🔄 {C_DIM}Will extract playlist info during download...{C_RESET}")
+			# Fallback to basic options, let yt-dlp handle playlist detection during download
 			try:
 				# Make educated guess about playlist status from URL
 				is_playlist = ("playlist" in url.lower() or "list=" in url)
 				
-				# For known playlist URLs like LM, create a mock info dict
 				if is_playlist:
-					mock_info = None
-					if "list=LM" in url or (url.lower().find("music.youtube.com") != -1 and "liked" in url.lower()):
-						mock_info = {
-							"_type": "playlist",
-							"playlist_title": "Liked Music",
-							"entries": []
-						}
-						print(f"  🎵 {C_HEAD}Detected playlist:{C_RESET} Liked Music (using URL pattern)")
-					
-					opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies, fast_mode, url, mock_info)
+					print(f"  🎵 {C_HEAD}Playlist detected from URL - folder will be named from playlist title{C_RESET}")
+					# Don't pass mock info - let yt-dlp's template system handle it
+					opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies, fast_mode, url, None)
 				else:
 					opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies, fast_mode, url)
 			except Exception as e2:
-				print(C_ERR + f"Error setting up download options: {e2}" + C_RESET)
+				print(f"    {C_ERR}Error setting up download options: {e2}{C_RESET}")
 				continue
 		
+		print(f"  🚀 {C_OK}Starting download process...{C_RESET}")
+		
 		# Use our custom YoutubeDL class that uses JSON archive and copies files
-		with SmartYoutubeDL(opts, base_dir, container, url) as ydl:
+		with SmartYoutubeDL(opts, base_dir, container, url, archive_mgr=archive_mgr) as ydl:
 			# Set playlist info if available
 			if info and is_playlist:
 				ydl._playlist_info = info
@@ -685,13 +1161,16 @@ def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str
 			try:
 				# Auto-use cookies if it's a YT Music Liked URL
 				if not force_firefox_cookies and is_youtube_music_liked(url):
-					print(C_WARN + "Auto-enabling Firefox cookies for Liked Music." + C_RESET)
+					print(f"  🍪 {C_WARN}Auto-enabling Firefox cookies for Liked Music.{C_RESET}")
 					ydl.params["cookiesfrombrowser"] = ("firefox", None, None, None)
 				
 				# Reset counters for this URL
 				ydl.skipped_count = 0
 				ydl.downloaded_count = 0
 				ydl.copied_count = 0
+				
+				print(f"  🎯 {C_DIM}Checking archive for existing files...{C_RESET}")
+				print(f"  📥 {C_OK}Beginning download/copy process...{C_RESET}")
 				
 				# Download with smart archive checking and copying
 				res = ydl.download([url])
@@ -724,28 +1203,111 @@ def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str
 				if res == 0:
 					total_ok += 1
 				else:
-					print(C_WARN + f"⚠ Download completed with warnings for: {url}" + C_RESET)
+					print(f"    ⚠ {C_WARN}Download completed with warnings for: {url}{C_RESET}")
 					
 				# Generate M3U for playlists
 				if is_playlist:
 					try:
-						# Determine the correct output directory for M3U
-						playlist_folder_name = get_playlist_folder_name(url, info)
-						playlist_dir = base_dir / playlist_folder_name
-						if playlist_dir.exists():
-							generate_m3u_for_playlist(info or {"playlist_title": playlist_folder_name, "entries": []}, playlist_dir, container)
-							print(f"    🎼 {C_DIM}Generated M3U playlist file{C_RESET}")
+						playlist_dir = base_dir / get_playlist_folder_name(url, info) if info else base_dir
+						if not playlist_dir.exists():
+							playlist_dir = create_playlist_folder(base_dir, url, info)
+						generate_m3u_for_playlist(info or {}, playlist_dir, container)
+						print(f"    🎼 {C_DIM}Generated M3U playlist file in {playlist_dir.name}{C_RESET}")
 					except Exception as e:
-						print(C_DIM + f"Note: Could not generate M3U file: {e}" + C_RESET)
+						print(f"    {C_DIM}Note: Could not generate M3U file: {e}{C_RESET}")
 					
 			except KeyboardInterrupt:
-				print(C_WARN + "\nDownload interrupted by user" + C_RESET)
+				print(f"\n{C_WARN}Download interrupted by user{C_RESET}")
 				raise
 			except Exception as e:
-				print(C_ERR + f"✗ Error downloading {url}: {e}" + C_RESET)
-				# Continue with other URLs even if one fails
-				continue
+				# Check if we should retry with cookies for private playlists
+				if (not force_firefox_cookies and 
+				    not is_youtube_music_liked(url) and 
+				    should_retry_with_cookies(str(e), url)):
+					
+					print(f"  🔒 {C_WARN}Download failed - playlist may be private/restricted{C_RESET}")
+					print(f"  🔄 {C_DIM}Retrying with Firefox cookies for authentication...{C_RESET}")
+					
+					try:
+						# Recreate YoutubeDL with cookies enabled
+						opts["cookiesfrombrowser"] = ("firefox", None, None, None)
+						with SmartYoutubeDL(opts, base_dir, container, url, archive_mgr=archive_mgr) as ydl_with_cookies:
+							# Set playlist info if available
+							if info and is_playlist:
+								ydl_with_cookies._playlist_info = info
+							elif is_playlist and "list=LM" in url:
+								ydl_with_cookies._playlist_info = {
+									"_type": "playlist",
+									"playlist_title": "Liked Music",
+									"entries": []
+								}
+							
+							# Reset counters for retry
+							ydl_with_cookies.skipped_count = 0
+							ydl_with_cookies.downloaded_count = 0
+							ydl_with_cookies.copied_count = 0
+							
+							print(f"  🍪 {C_OK}Authenticated successfully - resuming download...{C_RESET}")
+							res = ydl_with_cookies.download([url])
+							
+							# Report results with better feedback
+							total_actions = ydl_with_cookies.downloaded_count + ydl_with_cookies.copied_count + ydl_with_cookies.skipped_count
+							
+							print(f"\n  📈 {C_HEAD}Summary for this URL:{C_RESET}")
+							if ydl_with_cookies.downloaded_count > 0:
+								print(f"    ✅ {C_OK}Downloaded (new files): {ydl_with_cookies.downloaded_count} file(s){C_RESET}")
+							if ydl_with_cookies.copied_count > 0:
+								print(f"    📋 {C_OK}Copied from archive (not downloaded): {ydl_with_cookies.copied_count} file(s){C_RESET}")
+							if ydl_with_cookies.skipped_count > 0:
+								print(f"    ⏭️  {C_DIM}Skipped (already exists locally): {ydl_with_cookies.skipped_count} file(s){C_RESET}")
+							
+							if total_actions > 0:
+								archive_efficiency = (ydl_with_cookies.copied_count / total_actions) * 100
+								if archive_efficiency > 0:
+									print(f"    🎯 {C_DIM}Archive efficiency: {archive_efficiency:.1f}% (avoided {ydl_with_cookies.copied_count} downloads){C_RESET}")
+								download_efficiency = (ydl_with_cookies.skipped_count / total_actions) * 100
+								if download_efficiency > 0:
+									print(f"    💾 {C_DIM}Already had locally: {download_efficiency:.1f}% ({ydl_with_cookies.skipped_count} files){C_RESET}")
+							
+							# Show total bandwidth/time saved
+							total_saved = ydl_with_cookies.copied_count + ydl_with_cookies.skipped_count
+							if total_saved > 0:
+								print(f"    🚀 {C_OK}Total files not downloaded: {total_saved}/{total_actions} ({(total_saved/total_actions)*100:.1f}%){C_RESET}")
+							
+							# Download successful
+							if res == 0:
+								total_ok += 1
+								print(f"  ✅ {C_OK}Authentication retry successful!{C_RESET}")
+							else:
+								print(f"    ⚠ {C_WARN}Download completed with warnings for: {url}{C_RESET}")
+								
+							# Generate M3U for playlists (retry version)
+							if is_playlist:
+								try:
+									playlist_dir = base_dir / get_playlist_folder_name(url, info) if info else base_dir
+									if not playlist_dir.exists():
+										playlist_dir = create_playlist_folder(base_dir, url, info)
+									generate_m3u_for_playlist(info or {}, playlist_dir, container)
+									print(f"    🎼 {C_DIM}Generated M3U playlist file in {playlist_dir.name}{C_RESET}")
+								except Exception as m3u_error:
+									print(f"    {C_DIM}Note: Could not generate M3U file: {m3u_error}{C_RESET}")
+							
+							# Continue to next URL after successful retry
+							continue
+							
+					except Exception as retry_error:
+						print(f"  ❌ {C_ERR}Retry with cookies also failed: {retry_error}{C_RESET}")
+						print(f"    ✗ {C_ERR}Error downloading {url}: {e}{C_RESET}")
+						# Continue with other URLs even if retry fails
+						continue
+				else:
+					# Original error, no retry needed
+					print(f"    ✗ {C_ERR}Error downloading {url}: {e}{C_RESET}")
+					# Continue with other URLs even if one fails
+					continue
 	
+	# Save archive once at the end
+	archive_mgr.save()
 	return total_ok
 
 
@@ -1135,20 +1697,20 @@ def interactive_clear() -> int:
 
 
 def show_archive_info() -> None:
-	"""Display information about the archive."""
-	archive = load_archive()
+	"""Display information about the archive using optimized ArchiveManager."""
+	archive_mgr = ArchiveManager()
 	archive_path = get_appdata_archive_path()
 	
-	print(C_HEAD + "Archive Information:" + C_RESET)
+	print(f"{C_HEAD}Archive Information:{C_RESET}")
 	print(f"  Location: {C_DIM}{archive_path}{C_RESET}")
-	print(f"  Total entries: {C_DIM}{len(archive)}{C_RESET}")
+	print(f"  Total entries: {C_DIM}{len(archive_mgr.data)}{C_RESET}")
 	
-	if archive:
-		mp3_count = sum(1 for entry in archive.values() if entry.get('format') == 'mp3')
-		mp4_count = sum(1 for entry in archive.values() if entry.get('format') == 'mp4')
-		mkv_count = sum(1 for entry in archive.values() if entry.get('format') == 'mkv')
-		native_count = sum(1 for entry in archive.values() if entry.get('format') == 'native')
-		local_count = sum(1 for entry in archive.values() if entry.get('extractor') == 'local')
+	if archive_mgr.data:
+		mp3_count = sum(1 for entry in archive_mgr.data.values() if entry.get('format') == 'mp3')
+		mp4_count = sum(1 for entry in archive_mgr.data.values() if entry.get('format') == 'mp4')
+		mkv_count = sum(1 for entry in archive_mgr.data.values() if entry.get('format') == 'mkv')
+		native_count = sum(1 for entry in archive_mgr.data.values() if entry.get('format') == 'native')
+		local_count = sum(1 for entry in archive_mgr.data.values() if entry.get('extractor') == 'local')
 		
 		print(f"  MP3 files: {C_DIM}{mp3_count}{C_RESET}")
 		print(f"  MP4 files: {C_DIM}{mp4_count}{C_RESET}")
@@ -1179,25 +1741,25 @@ def load_urls_from_file(file_path: str) -> list[str]:
 
 
 def load_directory_to_archive(directory_path: str) -> bool:
-	"""Scan a directory and add all MP3/MP4 files to the archive."""
+	"""Scan a directory and add all MP3/MP4 files to the archive using optimized ArchiveManager."""
 	try:
 		dir_path = Path(directory_path)
 		if not dir_path.exists():
-			print(C_ERR + f"Directory not found: {directory_path}" + C_RESET)
+			print(f"    {C_ERR}Directory not found: {directory_path}{C_RESET}")
 			return False
 		
 		if not dir_path.is_dir():
-			print(C_ERR + f"Path is not a directory: {directory_path}" + C_RESET)
+			print(f"    {C_ERR}Path is not a directory: {directory_path}{C_RESET}")
 			return False
 		
-		print(C_HEAD + f"Scanning directory: {dir_path}" + C_RESET)
+		print(f"{C_HEAD}Scanning directory: {dir_path}{C_RESET}")
 		
 		# Supported file extensions
 		audio_extensions = ['.mp3', '.m4a', '.aac', '.flac', '.wav']
 		video_extensions = ['.mp4', '.mkv', '.webm', '.avi', '.mov']
 		all_extensions = audio_extensions + video_extensions
 		
-		archive = load_archive()
+		archive_mgr = ArchiveManager()
 		added_count = 0
 		
 		# Recursively scan directory
@@ -1217,11 +1779,11 @@ def load_directory_to_archive(directory_path: str) -> bool:
 				# Check if this exact file path is already in archive (prevent duplicates)
 				already_exists = any(
 					entry.get('file_path') == abs_path and entry.get('format') == container
-					for entry in archive.values()
+					for entry in archive_mgr.data.values()
 				)
 				
 				if not already_exists:
-					archive[key] = {
+					archive_mgr.data[key] = {
 						'id': file_path.stem,
 						'extractor': 'local',
 						'title': file_path.stem,
@@ -1229,22 +1791,23 @@ def load_directory_to_archive(directory_path: str) -> bool:
 						'file_path': abs_path,
 						'download_date': file_path.stat().st_mtime
 					}
+					archive_mgr._dirty = True
 					added_count += 1
 					print(f"  📁 Added: {file_path.name}")
 				else:
 					print(f"  ⏭️  Already in archive: {file_path.name}")
 		
 		# Save the updated archive
-		save_archive(archive)
+		archive_mgr.save()
 		
-		print(C_OK + f"✓ Added {added_count} new files to archive" + C_RESET)
+		print(f"{C_OK}✓ Added {added_count} new files to archive{C_RESET}")
 		if added_count == 0:
-			print(C_DIM + "  (All files were already in archive)" + C_RESET)
+			print(f"    {C_DIM}(All files were already in archive){C_RESET}")
 		
 		return True
 		
 	except Exception as e:
-		print(C_ERR + f"Error scanning directory: {e}" + C_RESET)
+		print(f"    {C_ERR}Error scanning directory: {e}{C_RESET}")
 		return False
 
 
