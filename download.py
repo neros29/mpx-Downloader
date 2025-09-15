@@ -98,15 +98,18 @@ def choose_format() -> tuple[str, str]:
 	print(f"  {C_HEAD}[1]{C_RESET} MP3 (audio only)")
 	print(f"  {C_HEAD}[2]{C_RESET} MKV (video, best seeking)")
 	print(f"  {C_HEAD}[3]{C_RESET} MP4 (video, max compatibility)")
+	print(f"  {C_HEAD}[4]{C_RESET} Native (audio, fastest - no conversion)")
 	while True:
-		choice = prompt("Enter 1, 2, or 3", default="1")
+		choice = prompt("Enter 1, 2, 3, or 4", default="1")
 		if choice == "1":
-			return ("mp3", "mp3")
+			return ("mp3", "audio")
 		elif choice == "2":
 			return ("mkv", "video")
 		elif choice == "3":
 			return ("mp4", "video")
-		print(C_WARN + "Please enter 1, 2, or 3." + C_RESET)
+		elif choice == "4":
+			return ("native", "audio")
+		print(C_WARN + "Please enter 1, 2, 3, or 4." + C_RESET)
 
 
 def split_urls(s: str) -> list[str]:
@@ -192,7 +195,7 @@ def find_in_archive(video_id: str, extractor: str, container: str) -> dict | Non
 	if key in archive:
 		entry = archive[key]
 		file_path = Path(entry['file_path'])
-		if file_path.exists() and file_path.stat().st_size > 0:
+		if file_path.exists():
 			return entry
 		else:
 			# File no longer exists, remove from archive
@@ -214,8 +217,12 @@ def copy_from_archive(archive_entry: dict, target_dir: Path, container: str) -> 
 		clean_title = sanitize_filename(title, restricted=False)
 		
 		# Determine extension based on format and source file
-		if container == "mp3":
-			target_ext = ".mp3"
+		if container in ("mp3", "native"):
+			# For audio: preserve original extension if not mp3, otherwise use .mp3
+			if container == "mp3":
+				target_ext = ".mp3" if source_path.suffix.lower() == ".mp3" else source_path.suffix
+			else:  # native
+				target_ext = source_path.suffix
 		else:
 			target_ext = source_path.suffix or f".{container}"
 		
@@ -251,13 +258,15 @@ def check_existing_file(base_dir: Path, info: dict, container: str) -> bool:
 		# Determine the expected extension
 		if container == "mp3":
 			extensions = [".mp3"]
+		elif container == "native":
+			extensions = [".m4a", ".opus", ".webm", ".mp3", ".aac"]  # Common audio formats
 		else:
 			extensions = [".mp4", ".m4v", ".mkv", ".webm", ".avi"]  # Common video formats
 		
 		# Check for existing files with any of the possible extensions
 		for ext in extensions:
 			potential_file = base_dir / f"{clean_title}{ext}"
-			if potential_file.exists() and potential_file.stat().st_size > 0:
+			if potential_file.exists():
 				return True
 		return False
 	except Exception:
@@ -303,6 +312,8 @@ def build_archive_from_existing_files(download_dir: Path, container: str) -> Non
 		# Determine extensions based on format
 		if container == "mp3":
 			extensions = ['.mp3']
+		elif container == "native":
+			extensions = ['.m4a', '.opus', '.webm', '.mp3', '.aac']
 		else:
 			extensions = ['.mp4', '.mkv', '.webm', '.avi']
 		
@@ -351,7 +362,7 @@ def generate_m3u_for_playlist(info: dict, download_dir: Path, container: str) ->
 	try:
 		with (download_dir / m3u_name).open("w", encoding="utf-8") as f:
 			for line in lines:
-				f.write(line + "\r\n")
+				f.write(line + "\n")
 	except Exception:
 		pass
 
@@ -410,34 +421,45 @@ class SmartYoutubeDL(YoutubeDL):
 			if video_id and extractor and self.container and self.base_dir:
 				# Determine the expected file path
 				clean_title = sanitize_filename(title, restricted=False)
-				if self.container == "mp3":
-					ext = ".mp3"
-				else:
-					ext = f".{self.container}"  # .mkv or .mp4
+				file_path = None
 				
-				file_path = self.base_dir / f"{clean_title}{ext}"
-				if file_path.exists():
+				if self.container == "mp3":
+					file_path = self.base_dir / f"{clean_title}.mp3"
+				elif self.container == "native":
+					# For native format, we need to check what file actually exists
+					# Common audio extensions for native downloads
+					possible_exts = [".m4a", ".opus", ".webm", ".mp3", ".aac"]
+					for possible_ext in possible_exts:
+						potential_path = self.base_dir / f"{clean_title}{possible_ext}"
+						if potential_path.exists():
+							file_path = potential_path
+							break
+				else:
+					file_path = self.base_dir / f"{clean_title}.{self.container}"
+				
+				if file_path and file_path.exists():
 					add_to_archive(video_id, extractor, title, file_path, self.container)
 		except Exception as e:
 			print(C_DIM + f"Note: Could not add to archive: {e}" + C_RESET)
 
 
-def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_cookies: bool) -> dict:
+def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_cookies: bool, fast_mode: bool = False) -> dict:
 	is_audio = fmt_type == "audio"
 	opts: dict = {
 		"outtmpl": build_outtmpl(base_dir, is_audio),
 		"restrictfilenames": False,
 		"windowsfilenames": True,
-		"noprogress": False,
+		"noprogress": fast_mode,  # Reduce console writes in fast mode
 		"ignoreerrors": True,
 		"retries": 10,
 		"fragment_retries": 10,
-		"concurrent_fragment_downloads": 5,
+		"concurrent_fragment_downloads": 8,  # Bumped from 5 for better performance
 		"continuedl": True,
 		"writeinfojson": False,  # Disable individual JSON files
-		"writethumbnail": True,
+		"writethumbnail": not fast_mode,  # Skip thumbnails in fast mode
 		"overwrites": False,
 		"extract_flat": False,  # Don't extract flat for efficient playlist processing
+		"lazy_playlist": True,  # Enable lazy playlist processing for faster startup
 		"progress_hooks": [lambda d: download_progress_hook(d, base_dir, container)],
 		"postprocessor_args": [
 			"-metadata", "comment=Downloaded with yt-dlp wrapper",
@@ -448,27 +470,44 @@ def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_c
 	}
 
 	if is_audio:
-		opts.update(
-			{
+		if container == "native":
+			# Native format: No conversion, fastest
+			opts.update({
 				"format": "bestaudio/best",
-				"postprocessors": [
-					{
-						"key": "FFmpegExtractAudio",
-						"preferredcodec": "mp3",
-						"preferredquality": "0",
-					},
-					{"key": "EmbedThumbnail"},
-					{"key": "FFmpegMetadata"},
-				],
+				"postprocessors": [],  # No post-processing at all
 				"prefer_ffmpeg": True,
 				"keepvideo": False,
-			}
-		)
+			})
+		else:
+			# MP3 format
+			postprocessors = [
+				{
+					"key": "FFmpegExtractAudio",
+					"preferredcodec": "mp3",
+					"preferredquality": "0",
+				},
+			]
+			
+			# Add metadata and thumbnail processing only if not in fast mode
+			if not fast_mode:
+				postprocessors.extend([
+					{"key": "EmbedThumbnail"},
+					{"key": "FFmpegMetadata"},
+				])
+			
+			opts.update({
+				"format": "bestaudio/best",
+				"postprocessors": postprocessors,
+				"prefer_ffmpeg": True,
+				"keepvideo": False,
+			})
 	else:
 		# Video settings optimized for container type
-		video_postprocessors = [
-			{"key": "FFmpegMetadata"},
-		]
+		video_postprocessors = []
+		
+		# Add metadata processing unless in fast mode
+		if not fast_mode:
+			video_postprocessors.append({"key": "FFmpegMetadata"})
 		
 		if container == "mkv":
 			# MKV: Better seeking, can embed thumbnails reliably
@@ -477,7 +516,8 @@ def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_c
 				"merge_output_format": "mkv",
 				"remux_video": "mkv",  # Also remux single-stream downloads
 			})
-			video_postprocessors.append({"key": "EmbedThumbnail"})
+			if not fast_mode:
+				video_postprocessors.append({"key": "EmbedThumbnail"})
 			# Add faststart equivalent for MKV seeking
 			opts["postprocessor_args"].extend(["-movflags", "+faststart"])
 		else:
@@ -509,10 +549,10 @@ def ydl_opts_common(base_dir: Path, container: str, fmt_type: str, use_firefox_c
 	return opts
 
 
-def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str, force_firefox_cookies: bool) -> int:
+def download_urls(urls: list[str], base_dir: Path, container: str, fmt_type: str, force_firefox_cookies: bool, fast_mode: bool = False) -> int:
 	# Build options
 	try:
-		opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies)
+		opts = ydl_opts_common(base_dir, container, fmt_type, force_firefox_cookies, fast_mode)
 	except Exception as e:
 		print(C_ERR + f"Error setting up download options: {e}" + C_RESET)
 		return 0
@@ -585,7 +625,9 @@ def show_help() -> None:
 
 {C_HEAD}OPTIONS:{C_RESET}
   {C_ASK}--help{C_RESET}                    Show this help message and exit
-  {C_ASK}--format{C_RESET} FORMAT           Download format: mp3, mkv, mp4 (default: interactive)
+  {C_ASK}--format{C_RESET} FORMAT           Download format: mp3, mkv, mp4, native (default: interactive)
+  {C_ASK}--fast{C_RESET}                    Fast mode - skip thumbnails and metadata for speed
+  {C_ASK}--non-interactive{C_RESET}         Auto-confirm prompts (for scripts/scheduled tasks)
   {C_ASK}--outdir{C_RESET} PATH             Output directory (default: current directory)
   {C_ASK}--firefox-cookies{C_RESET}         Use Firefox cookies for authentication
   {C_ASK}--file{C_RESET} FILE               Read URLs from text file (one per line)
@@ -601,6 +643,7 @@ def show_help() -> None:
   {C_ASK}mp3{C_RESET}     Audio only (MP3 with embedded thumbnails)
   {C_ASK}mkv{C_RESET}     Video in MKV container (best seeking, embedded thumbnails)
   {C_ASK}mp4{C_RESET}     Video in MP4 container (maximum compatibility)
+  {C_ASK}native{C_RESET}  Audio in original format (fastest - no conversion)
 
 {C_HEAD}EXAMPLES:{C_RESET}
   {C_DIM}# Interactive mode{C_RESET}
@@ -609,11 +652,17 @@ def show_help() -> None:
   {C_DIM}# Download audio only{C_RESET}
   python download.py --format mp3 "https://youtube.com/watch?v=..."
 
+  {C_DIM}# Fast audio download (no thumbnails/metadata){C_RESET}
+  python download.py --format native --fast "https://youtube.com/playlist?list=..."
+
   {C_DIM}# Download video with best seeking (MKV){C_RESET}
   python download.py --format mkv --outdir ./music "https://youtube.com/playlist?list=..."
 
   {C_DIM}# Use Firefox cookies for private playlists{C_RESET}
   python download.py --firefox-cookies --format mp3 "https://music.youtube.com/playlist?list=LM"
+
+  {C_DIM}# Non-interactive mode for scripts{C_RESET}
+  python download.py --non-interactive --format native --fast --file urls.txt
 
   {C_DIM}# Load URLs from file{C_RESET}
   python download.py --file urls.txt --format mkv
@@ -645,7 +694,9 @@ def parse_args(argv: list[str]) -> dict:
 	# Lightweight arg parsing to allow non-interactive usage via download.bat
 	# Supported:
 	#   --help                    (show help and exit)
-	#   --format mp3|mkv|mp4
+	#   --format mp3|mkv|mp4|native
+	#   --fast                    (fast mode - skip thumbnails/metadata)
+	#   --non-interactive         (auto-confirm prompts)
 	#   --outdir <path>
 	#   --firefox-cookies
 	#   --load <directory>        (scan directory and add files to archive)
@@ -657,6 +708,8 @@ def parse_args(argv: list[str]) -> dict:
 	args = {
 		"help": False,
 		"format": None,
+		"fast": False,
+		"non_interactive": False,
 		"outdir": None,
 		"firefox_cookies": False,
 		"load_directory": None,
@@ -677,6 +730,12 @@ def parse_args(argv: list[str]) -> dict:
 		elif tok == "--format" and i + 1 < n:
 			args["format"] = argv[i + 1]
 			i += 2
+		elif tok == "--fast":
+			args["fast"] = True
+			i += 1
+		elif tok == "--non-interactive":
+			args["non_interactive"] = True
+			i += 1
 		elif tok == "--outdir" and i + 1 < n:
 			args["outdir"] = argv[i + 1]
 			i += 2
@@ -953,10 +1012,14 @@ def show_archive_info() -> None:
 	if archive:
 		mp3_count = sum(1 for entry in archive.values() if entry.get('format') == 'mp3')
 		mp4_count = sum(1 for entry in archive.values() if entry.get('format') == 'mp4')
+		mkv_count = sum(1 for entry in archive.values() if entry.get('format') == 'mkv')
+		native_count = sum(1 for entry in archive.values() if entry.get('format') == 'native')
 		local_count = sum(1 for entry in archive.values() if entry.get('extractor') == 'local')
 		
 		print(f"  MP3 files: {C_DIM}{mp3_count}{C_RESET}")
 		print(f"  MP4 files: {C_DIM}{mp4_count}{C_RESET}")
+		print(f"  MKV files: {C_DIM}{mkv_count}{C_RESET}")
+		print(f"  Native files: {C_DIM}{native_count}{C_RESET}")
 		print(f"  Local files: {C_DIM}{local_count}{C_RESET}")
 
 
@@ -1143,6 +1206,8 @@ def main() -> int:
 				container, fmt_type = ("mkv", "video")
 			elif args["format"] == "mp4":
 				container, fmt_type = ("mp4", "video")
+			elif args["format"] == "native":
+				container, fmt_type = ("native", "audio")
 			else:
 				print(C_ERR + f"Invalid format: {args['format']}. Using MP3 as default." + C_RESET)
 				container, fmt_type = ("mp3", "audio")
@@ -1201,14 +1266,19 @@ def main() -> int:
 	print("  Output to: " + C_DIM + str(base_dir) + C_RESET)
 	if use_firefox_cookies:
 		print("  Cookies:   " + C_DIM + "Firefox (cookies-from-browser)" + C_RESET)
+	if args["fast"]:
+		print("  Mode:      " + C_DIM + "Fast (no thumbnails/metadata)" + C_RESET)
 	print()
 
 	# Confirm
 	try:
-		confirm = prompt("Proceed? (y/n)", "y").lower()
-		if confirm not in ("y", "yes"):
-			print(C_WARN + "Canceled by user." + C_RESET)
-			return 0
+		if args["non_interactive"]:
+			print(C_DIM + "Non-interactive mode: proceeding automatically" + C_RESET)
+		else:
+			confirm = prompt("Proceed? (y/n)", "y").lower()
+			if confirm not in ("y", "yes"):
+				print(C_WARN + "Canceled by user." + C_RESET)
+				return 0
 	except KeyboardInterrupt:
 		print(C_WARN + "\nCanceled by user." + C_RESET)
 		return 0
@@ -1218,7 +1288,7 @@ def main() -> int:
 
 	# Download
 	try:
-		ok = download_urls(urls, base_dir, container, fmt_type, use_firefox_cookies)
+		ok = download_urls(urls, base_dir, container, fmt_type, use_firefox_cookies, args["fast"])
 	except KeyboardInterrupt:
 		print(C_WARN + "\nDownload interrupted by user." + C_RESET)
 		return 130

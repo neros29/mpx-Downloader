@@ -194,7 +194,7 @@ class TestM3UGeneration:
         
         # Check M3U content
         content = m3u_file.read_text(encoding="utf-8")
-        lines = content.strip().split('\r\n')
+        lines = content.strip().split('\n')
         
         # Should only include existing files
         assert "Song 1.mp3" in lines
