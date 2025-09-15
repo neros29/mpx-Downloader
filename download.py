@@ -31,6 +31,47 @@ except Exception as e:  # pragma: no cover
 	sys.exit(1)
 
 
+def resolve_target_dir(base_dir: Path, url: str, info: dict | None = None) -> Path:
+	"""Centralized logic to determine target directory for downloads."""
+	if is_youtube_music_liked(url):
+		target_dir = base_dir / "Liked Music"
+	elif info and (info.get("_type") == "playlist" or info.get("entries")):
+		# Use playlist info to determine folder name
+		playlist_name = info.get("playlist_title") or info.get("playlist") \
+		                or info.get("uploader") or info.get("channel") or "Playlist"
+		target_dir = base_dir / sanitize_filename(str(playlist_name), restricted=False)
+	elif "playlist" in url.lower() or "list=" in url.lower():
+		# Playlist URL but no info yet - will be resolved later by yt-dlp template
+		return base_dir  # Let yt-dlp template handle it
+	else:
+		# Single video
+		target_dir = base_dir
+	
+	target_dir.mkdir(parents=True, exist_ok=True)
+	return target_dir
+
+
+def clean_title(title_or_info) -> str:
+	"""Centralized title cleaning using yt-dlp's sanitizer."""
+	if isinstance(title_or_info, dict):
+		title = title_or_info.get("title", "unknown")
+	else:
+		title = str(title_or_info) if title_or_info else "unknown"
+	return sanitize_filename(title, restricted=False)
+
+
+def expected_extensions(container: str) -> list[str]:
+	"""Get expected file extensions for a container format."""
+	if container == "mp3":
+		return [".mp3"]
+	elif container == "native":
+		return [".m4a", ".opus", ".webm", ".mp3", ".aac"]
+	elif container in ("mp4", "mkv"):
+		return [".mp4", ".mkv", ".webm", ".avi"]
+	else:
+		return [f".{container}"]
+
+
 def get_appdata_archive_path() -> Path:
 	"""Get the path to the JSON archive file in platform-appropriate directory."""
 	if os.name == 'nt':  # Windows
@@ -67,16 +108,25 @@ class ArchiveManager:
 	
 	def key(self, vid: str, extractor: str, container: str) -> str:
 		"""Generate a consistent key for archive entries."""
-		return f"{(extractor or 'generic').lower()}_{vid}_{container}"
+		# Normalize extractor to handle common variations
+		extractor_clean = (extractor or 'youtube').lower()
+		# Map common YouTube extractor variations to a standard name
+		if extractor_clean in ('youtube', 'youtubetab', 'youtube:tab'):
+			extractor_clean = 'youtube'
+		return f"{extractor_clean}_{vid}_{container}"
 	
 	def find(self, vid: str, extractor: str, container: str, title: str | None = None) -> dict | None:
 		"""Find a video in the archive, with title fallback if no exact match."""
 		k = self.key(vid, extractor, container)
 		
+		# Debug output - uncomment if needed for troubleshooting
+		# print(f"    🔍 Looking for archive key: {k} (vid={vid}, extractor={extractor}, container={container})")
+		
 		# First try exact key match
 		if k in self.data:
 			p = Path(self.data[k]["file_path"])
 			if p.exists():
+				# print(f"    ✅ Found exact match in archive: {k}")
 				return self.data[k]
 			# File no longer exists, remove from archive
 			del self.data[k]
@@ -197,7 +247,9 @@ def fast_copy_from_archive(url: str, base_dir: Path, container: str, archive_mgr
 		if not vid:
 			continue
 		
-		entry = archive_mgr.find(vid, e.get("extractor_key") or "YouTube", container, title)
+		# Use consistent extractor naming - same logic as SmartYoutubeDL.process_info
+		extractor = e.get("extractor_key", e.get("extractor", "youtube"))
+		entry = archive_mgr.find(vid, extractor, container, title)
 		if entry:
 			if optimized_copy_from_archive(entry, playlist_dir, container):
 				copied_count += 1
@@ -222,18 +274,20 @@ def optimized_copy_from_archive(archive_entry: dict, target_dir: Path, container
 		
 		# Determine target filename
 		title = archive_entry['title']
-		clean_title = sanitize_filename(title, restricted=False)
+		clean_title_str = clean_title(title)
 		
 		# Determine extension based on format and source file
-		if container in ("mp3", "native"):
-			if container == "mp3":
-				target_ext = ".mp3" if source_path.suffix.lower() == ".mp3" else source_path.suffix
-			else:  # native
-				target_ext = source_path.suffix
+		if container == "mp3":
+			# For MP3 mode, enforce .mp3 extension regardless of source format
+			target_ext = ".mp3"
+		elif container == "native":
+			# For native mode, preserve original extension
+			target_ext = source_path.suffix
 		else:
+			# For video containers, use specified container or source extension
 			target_ext = source_path.suffix or f".{container}"
 		
-		target_path = target_dir / f"{clean_title}{target_ext}"
+		target_path = target_dir / f"{clean_title_str}{target_ext}"
 		
 		# Avoid copying to the same location
 		if source_path.resolve() == target_path.resolve():
@@ -500,117 +554,20 @@ def split_urls(s: str) -> list[str]:
 
 
 def build_outtmpl(base_dir: Path, is_audio: bool, url: str = "", info: dict | None = None) -> str:
-	if is_youtube_music_liked(url):
-		liked_dir = base_dir / "Liked Music"
-		liked_dir.mkdir(parents=True, exist_ok=True)
-		return str(liked_dir / "%(title)s.%(ext)s")
-		
-	# If we already have playlist metadata, pick an explicit folder name now
-	if info and (info.get("_type") == "playlist" or info.get("entries")):
-		playlist_dir = base_dir / get_playlist_folder_name(url, info)
-		playlist_dir.mkdir(parents=True, exist_ok=True)
-		return str(playlist_dir / "%(title)s.%(ext)s")
-
-	# If we *suspect* a playlist but don't have info yet, let yt-dlp resolve it
-	if ("playlist" in url.lower() or "list=" in url.lower()) and not info:
+	"""Build output template using centralized target directory resolution."""
+	target_dir = resolve_target_dir(base_dir, url, info)
+	
+	# If we suspect a playlist but don't have info yet, let yt-dlp resolve it with template
+	if ("playlist" in url.lower() or "list=" in url.lower()) and not info and not is_youtube_music_liked(url):
 		base_dir.mkdir(parents=True, exist_ok=True)
 		# Use a robust fallthrough so yt-dlp fills whichever it knows
 		return str(base_dir / "%(playlist_title|playlist|uploader|channel|id)s" / "%(title)s.%(ext)s")
-
-	# Single item
-	base_dir.mkdir(parents=True, exist_ok=True)
-	return str(base_dir / "%(title)s.%(ext)s")
-
-
-def load_archive() -> dict:
-	"""Load the download archive from AppData."""
-	archive_path = get_appdata_archive_path()
-	if not archive_path.exists():
-		return {}
 	
-	try:
-		with archive_path.open('r', encoding='utf-8') as f:
-			return json.load(f)
-	except Exception as e:
-		print(C_WARN + f"Warning: Could not load archive: {e}" + C_RESET)
-		return {}
+	# Use resolved target directory
+	return str(target_dir / "%(title)s.%(ext)s")
 
 
-def save_archive(archive: dict) -> None:
-	"""Save the download archive to AppData."""
-	try:
-		archive_path = get_appdata_archive_path()
-		with archive_path.open('w', encoding='utf-8') as f:
-			json.dump(archive, f, indent=2, ensure_ascii=False)
-	except Exception as e:
-		print(C_WARN + f"Warning: Could not save archive: {e}" + C_RESET)
 
-
-def add_to_archive(video_id: str, extractor: str, title: str, file_path: Path, container: str) -> None:
-	"""Add a downloaded file to the archive with format differentiation."""
-	archive = load_archive()
-	# Include format in the key to differentiate MP3/MP4/MKV versions
-	key = f"{extractor.lower()}_{video_id}_{container}"
-	archive[key] = {
-		'id': video_id,
-		'extractor': extractor,
-		'title': title,
-		'format': container,
-		'file_path': str(file_path.absolute()),
-		'download_date': file_path.stat().st_mtime if file_path.exists() else 0.0
-	}
-	save_archive(archive)
-
-
-def find_in_archive(video_id: str, extractor: str, container: str, title: str | None = None) -> dict | None:
-	"""Find a video in the archive for the specific format and return its info if the file still exists."""
-	archive = load_archive()
-	key = f"{extractor.lower()}_{video_id}_{container}"
-	
-	# First try exact key match
-	if key in archive:
-		entry = archive[key]
-		file_path = Path(entry['file_path'])
-		if file_path.exists():
-			return entry
-		else:
-			# File no longer exists, remove from archive
-			del archive[key]
-			save_archive(archive)
-	
-	# If no exact match and we have a title, try title-based matching
-	if title:
-		# Clean the title for comparison (same as sanitize_filename does)
-		clean_title = sanitize_filename(title, restricted=False).lower()
-		
-		# Look through all archive entries for this container
-		keys_to_remove = []
-		for arch_key, entry in archive.items():
-			if arch_key.endswith(f"_{container}"):
-				# Check if file still exists
-				file_path = Path(entry['file_path'])
-				if not file_path.exists():
-					keys_to_remove.append(arch_key)
-					continue
-				
-				# Compare titles
-				archived_title = sanitize_filename(entry.get('title', ''), restricted=False).lower()
-				if clean_title == archived_title:
-					# Found a title match!
-					return entry
-		
-		# Clean up any missing files we found
-		if keys_to_remove:
-			for key_to_remove in keys_to_remove:
-				del archive[key_to_remove]
-			save_archive(archive)
-	
-	return None
-
-
-def copy_from_archive(archive_entry: dict, target_dir: Path, container: str) -> bool:
-	"""Copy a file from archive location to target directory (calls optimized version)."""
-	return optimized_copy_from_archive(archive_entry, target_dir, container)
 
 
 def folder_name_from_info(info: dict) -> str:
@@ -647,21 +604,12 @@ def create_playlist_folder(base_dir: Path, url: str, info: dict | None = None) -
 def check_existing_file(base_dir: Path, info: dict, container: str) -> bool:
 	"""Check if a file already exists based on the video info and format."""
 	try:
-		title = info.get("title", "unknown")
-		# Use yt-dlp's sanitizer to match the actual filename that would be created
-		clean_title = sanitize_filename(title, restricted=False)
-		
-		# Determine the expected extension
-		if container == "mp3":
-			extensions = [".mp3"]
-		elif container == "native":
-			extensions = [".m4a", ".opus", ".webm", ".mp3", ".aac"]  # Common audio formats
-		else:
-			extensions = [".mp4", ".m4v", ".mkv", ".webm", ".avi"]  # Common video formats
+		clean_title_str = clean_title(info)
+		extensions = expected_extensions(container)
 		
 		# Check for existing files with any of the possible extensions
 		for ext in extensions:
-			potential_file = base_dir / f"{clean_title}{ext}"
+			potential_file = base_dir / f"{clean_title_str}{ext}"
 			if potential_file.exists():
 				return True
 		return False
@@ -722,13 +670,7 @@ def _stable_key_for_path(abs_path: str, fmt: str) -> str:
 def build_archive_from_existing_files_optimized(download_dir: Path, container: str, archive_mgr: ArchiveManager) -> None:
 	"""Build archive from existing files using the optimized ArchiveManager."""
 	try:
-		# Determine extensions based on format
-		if container == "mp3":
-			extensions = ['.mp3']
-		elif container == "native":
-			extensions = ['.m4a', '.opus', '.webm', '.mp3', '.aac']
-		else:
-			extensions = ['.mp4', '.mkv', '.webm', '.avi']
+		extensions = expected_extensions(container)
 		
 		added_count = 0
 		for file_path in download_dir.glob("*"):
@@ -755,35 +697,7 @@ def build_archive_from_existing_files_optimized(download_dir: Path, container: s
 		print(f"    {C_WARN}Warning: Could not build archive from existing files: {e}{C_RESET}")
 
 
-def build_archive_from_existing_files(download_dir: Path, container: str) -> None:
-	"""Build archive from existing files in the download directory."""
-	try:
-		archive = load_archive()
-		# Determine extensions based on format
-		if container == "mp3":
-			extensions = ['.mp3']
-		elif container == "native":
-			extensions = ['.m4a', '.opus', '.webm', '.mp3', '.aac']
-		else:
-			extensions = ['.mp4', '.mkv', '.webm', '.avi']
-		
-		for file_path in download_dir.glob("*"):
-			if file_path.is_file() and file_path.suffix.lower() in extensions:
-				# Generate a stable key for existing files (without video ID)
-				key = _stable_key_for_path(str(file_path.absolute()), container)
-				
-				if key not in archive:
-					archive[key] = {
-						'id': file_path.stem,
-						'extractor': 'local',
-						'title': file_path.stem,
-						'format': container,
-						'file_path': str(file_path.absolute()),
-						'download_date': file_path.stat().st_mtime
-					}
-		save_archive(archive)
-	except Exception as e:
-		print(C_WARN + f"Warning: Could not build archive from existing files: {e}" + C_RESET)
+
 
 
 def generate_m3u_for_playlist(info: dict, download_dir: Path, container: str) -> None:
@@ -798,7 +712,7 @@ def generate_m3u_for_playlist(info: dict, download_dir: Path, container: str) ->
 		if not entry:
 			continue
 		title = entry.get("title") or "unknown"
-		fname = sanitize_filename(title, restricted=False) + f".{ext}"
+		fname = clean_title(title) + f".{ext}"
 		fpath = download_dir / fname
 		if fpath.exists():
 			# Write relative path for portability
@@ -808,7 +722,7 @@ def generate_m3u_for_playlist(info: dict, download_dir: Path, container: str) ->
 		return
 
 	m3u_name_source = info.get("playlist_title") or folder_name_from_info(info)
-	m3u_name = sanitize_filename(str(m3u_name_source), restricted=False) + ".m3u"
+	m3u_name = clean_title(m3u_name_source) + ".m3u"
 	try:
 		with (download_dir / m3u_name).open("w", encoding="utf-8") as f:
 			for line in lines:
@@ -847,7 +761,7 @@ class SmartYoutubeDL(YoutubeDL):
 		# Check if this is a single video entry (not a playlist)
 		if info_dict.get('_type') != 'playlist' and self.base_dir and self.container:
 			video_id = info_dict.get('id')
-			extractor = info_dict.get('extractor_key', info_dict.get('extractor', 'generic'))
+			extractor = info_dict.get('extractor_key', info_dict.get('extractor', 'youtube'))
 			title = info_dict.get('title', 'unknown')
 			
 			# Show which item we're processing
@@ -861,20 +775,16 @@ class SmartYoutubeDL(YoutubeDL):
 					print(f"    {C_DIM}Archive location: {archive_entry['file_path']}{C_RESET}")
 					# Try to copy from archive
 					# Determine target directory (playlist folder if applicable)
-					target_dir = self.base_dir
-					if hasattr(self, '_playlist_info') and self._playlist_info:
-						target_dir = create_playlist_folder(self.base_dir, self.url, self._playlist_info)
+					target_dir = resolve_target_dir(self.base_dir, self.url, getattr(self, '_playlist_info', None))
 					
-					if copy_from_archive(archive_entry, target_dir, self.container):
+					if optimized_copy_from_archive(archive_entry, target_dir, self.container):
 						self.copied_count += 1
 						return None  # Skip downloading
 					else:
 						print(f"    ⚠️  {C_WARN}Archive copy failed, will re-download{C_RESET}")
 				
 				# Check if file already exists in current directory
-				target_dir = self.base_dir
-				if hasattr(self, '_playlist_info') and self._playlist_info:
-					target_dir = create_playlist_folder(self.base_dir, self.url, self._playlist_info)
+				target_dir = resolve_target_dir(self.base_dir, self.url, getattr(self, '_playlist_info', None))
 				
 				if check_existing_file(target_dir, info_dict, self.container):
 					print(f"    ⏭️  {C_DIM}Skipping (file already exists locally){C_RESET}")
@@ -900,28 +810,40 @@ class SmartYoutubeDL(YoutubeDL):
 		"""Add a successfully downloaded file to the archive."""
 		try:
 			video_id = info_dict.get('id')
-			extractor = info_dict.get('extractor_key', info_dict.get('extractor', 'generic'))
+			extractor = info_dict.get('extractor_key', info_dict.get('extractor', 'youtube'))
 			title = info_dict.get('title', 'unknown')
 			
 			if video_id and extractor and self.container and self.base_dir:
-				# Determine the expected file path
-				clean_title = sanitize_filename(title, restricted=False)
+				# NEW: resolve the real target folder (playlist vs single) and then locate actual file
+				target_dir = resolve_target_dir(self.base_dir, self.url, getattr(self, '_playlist_info', None))
+				clean_title_str = clean_title(title)
+
 				file_path = None
-				
 				if self.container == "mp3":
-					file_path = self.base_dir / f"{clean_title}.mp3"
+					# Always .mp3
+					candidate = target_dir / f"{clean_title_str}.mp3"
+					if candidate.exists():
+						file_path = candidate
 				elif self.container == "native":
-					# For native format, we need to check what file actually exists
-					# Common audio extensions for native downloads
-					possible_exts = [".m4a", ".opus", ".webm", ".mp3", ".aac"]
-					for possible_ext in possible_exts:
-						potential_path = self.base_dir / f"{clean_title}{possible_ext}"
-						if potential_path.exists():
-							file_path = potential_path
+					# Probe native audio extensions (keep in sync with expected_extensions)
+					for ext in [".m4a", ".opus", ".webm", ".mp3", ".aac"]:
+						candidate = target_dir / f"{clean_title_str}{ext}"
+						if candidate.exists():
+							file_path = candidate
 							break
 				else:
-					file_path = self.base_dir / f"{clean_title}.{self.container}"
-				
+					# Video container (mp4/mkv) — prefer chosen container
+					candidate = target_dir / f"{clean_title_str}.{self.container}"
+					if not candidate.exists():
+						# Fallback to actual merged ext if yt-dlp decided otherwise
+						for ext in [".mp4", ".mkv", ".webm", ".avi"]:
+							alt = target_dir / f"{clean_title_str}{ext}"
+							if alt.exists():
+								candidate = alt
+								break
+					if candidate.exists():
+						file_path = candidate
+
 				if file_path and file_path.exists():
 					self.archive.add(video_id, extractor, title, file_path, self.container)
 		except Exception as e:
@@ -1400,6 +1322,7 @@ def parse_args(argv: list[str]) -> dict:
 	#   --show-archive
 	#   --backup                  (backup archive)
 	#   --clear [all|<name>|<from_date> [to_date]]
+	#   --debug                   (enable debug output)
 	#   <urls...>
 	args = {
 		"help": False,
@@ -1413,6 +1336,7 @@ def parse_args(argv: list[str]) -> dict:
 		"show_archive": False,
 		"backup": False,
 		"clear": [],
+		"debug": False,
 		"urls": [],
 	}
 	
@@ -1449,6 +1373,9 @@ def parse_args(argv: list[str]) -> dict:
 			i += 1
 		elif tok == "--backup":
 			args["backup"] = True
+			i += 1
+		elif tok == "--debug":
+			args["debug"] = True
 			i += 1
 		elif tok == "--clear":
 			i += 1
@@ -1488,14 +1415,14 @@ def backup_archive() -> bool:
 def clear_archive_by_name(search_term: str) -> int:
 	"""Clear archive entries that match a search term in the title."""
 	try:
-		archive = load_archive()
-		if not archive:
+		archive_mgr = ArchiveManager()
+		if not archive_mgr.data:
 			print(C_WARN + "Archive is empty." + C_RESET)
 			return 0
 		
 		# Find matching entries
 		matches = []
-		for key, entry in archive.items():
+		for key, entry in archive_mgr.data.items():
 			title = entry.get('title', '').lower()
 			if search_term.lower() in title:
 				matches.append((key, entry))
@@ -1521,9 +1448,10 @@ def clear_archive_by_name(search_term: str) -> int:
 		
 		# Remove matches
 		for key, _ in matches:
-			del archive[key]
+			del archive_mgr.data[key]
 		
-		save_archive(archive)
+		archive_mgr._dirty = True
+		archive_mgr.save()
 		print(C_OK + f"✓ Removed {len(matches)} entries from archive" + C_RESET)
 		return len(matches)
 		
@@ -1572,8 +1500,8 @@ def parse_date_input(date_str: str) -> datetime | None:
 def clear_archive_by_date(from_date_str: str, to_date_str: str | None = None) -> int:
 	"""Clear archive entries within a date range."""
 	try:
-		archive = load_archive()
-		if not archive:
+		archive_mgr = ArchiveManager()
+		if not archive_mgr.data:
 			print(C_WARN + "Archive is empty." + C_RESET)
 			return 0
 		
@@ -1594,7 +1522,7 @@ def clear_archive_by_date(from_date_str: str, to_date_str: str | None = None) ->
 		
 		# Find matching entries
 		matches = []
-		for key, entry in archive.items():
+		for key, entry in archive_mgr.data.items():
 			try:
 				download_date = float(entry.get('download_date', 0))
 				entry_date = datetime.fromtimestamp(download_date)
@@ -1626,9 +1554,10 @@ def clear_archive_by_date(from_date_str: str, to_date_str: str | None = None) ->
 		
 		# Remove matches
 		for key, _, _ in matches:
-			del archive[key]
+			del archive_mgr.data[key]
 		
-		save_archive(archive)
+		archive_mgr._dirty = True
+		archive_mgr.save()
 		print(C_OK + f"✓ Removed {len(matches)} entries from archive" + C_RESET)
 		return len(matches)
 		
@@ -1640,12 +1569,12 @@ def clear_archive_by_date(from_date_str: str, to_date_str: str | None = None) ->
 def clear_entire_archive() -> bool:
 	"""Clear the entire archive with confirmation."""
 	try:
-		archive = load_archive()
-		if not archive:
+		archive_mgr = ArchiveManager()
+		if not archive_mgr.data:
 			print(C_WARN + "Archive is already empty." + C_RESET)
 			return True
 		
-		count = len(archive)
+		count = len(archive_mgr.data)
 		print(C_WARN + f"⚠️  WARNING: This will delete ALL {count} entries from the archive!" + C_RESET)
 		print(C_DIM + "This action cannot be undone unless you have a backup." + C_RESET)
 		
@@ -1660,7 +1589,9 @@ def clear_entire_archive() -> bool:
 			return False
 		
 		# Clear the archive
-		save_archive({})
+		archive_mgr.data = {}
+		archive_mgr._dirty = True
+		archive_mgr.save()
 		print(C_OK + f"✓ Cleared entire archive ({count} entries removed)" + C_RESET)
 		return True
 		

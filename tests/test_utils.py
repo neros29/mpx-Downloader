@@ -331,5 +331,166 @@ class TestDateParsing:
             assert result is None, f"Should have failed to parse: {date_str}"
 
 
+class TestNewHelperFunctions:
+    """Test the new helper functions introduced in the refactor."""
+    
+    def setup_method(self):
+        """Setup for each test method."""
+        self.temp_dir = Path(tempfile.mkdtemp())
+    
+    def teardown_method(self):
+        """Cleanup after each test method."""
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir)
+    
+    def test_resolve_target_dir_youtube_music(self):
+        """Test target directory resolution for YouTube Music."""
+        url = "https://music.youtube.com/playlist?list=LM"
+        target_dir = download.resolve_target_dir(self.temp_dir, url, None)
+        
+        assert target_dir == self.temp_dir / "Liked Music"
+        assert target_dir.exists()
+    
+    def test_resolve_target_dir_playlist_with_info(self):
+        """Test target directory resolution for playlists with metadata."""
+        url = "https://youtube.com/playlist?list=PLtest"
+        info = {
+            "_type": "playlist",
+            "playlist_title": "My Test Playlist"
+        }
+        
+        target_dir = download.resolve_target_dir(self.temp_dir, url, info)
+        
+        assert target_dir == self.temp_dir / "My Test Playlist"
+        assert target_dir.exists()
+    
+    def test_resolve_target_dir_single_video(self):
+        """Test target directory resolution for single videos."""
+        url = "https://youtube.com/watch?v=abc123"
+        target_dir = download.resolve_target_dir(self.temp_dir, url, None)
+        
+        assert target_dir == self.temp_dir
+        assert target_dir.exists()
+    
+    def test_clean_title_string(self):
+        """Test title cleaning with string input."""
+        title = "Test Video: Special Characters! & More"
+        clean = download.clean_title(title)
+        
+        # Should be sanitized but still readable
+        assert isinstance(clean, str)
+        assert len(clean) > 0
+        # The sanitize_filename function should handle special characters
+        assert "Test Video" in clean
+    
+    def test_clean_title_dict(self):
+        """Test title cleaning with dict input."""
+        info = {"title": "Test Video: Special Characters! & More"}
+        clean = download.clean_title(info)
+        
+        assert isinstance(clean, str)
+        assert "Test Video" in clean
+    
+    def test_clean_title_unknown(self):
+        """Test title cleaning with None/unknown input."""
+        clean = download.clean_title(None)
+        assert clean == "unknown"
+        
+        clean = download.clean_title("")
+        assert clean == "unknown"
+        
+        clean = download.clean_title({})
+        assert clean == "unknown"
+    
+    def test_expected_extensions_mp3(self):
+        """Test expected extensions for MP3 format."""
+        extensions = download.expected_extensions("mp3")
+        assert extensions == [".mp3"]
+    
+    def test_expected_extensions_native(self):
+        """Test expected extensions for native audio format."""
+        extensions = download.expected_extensions("native")
+        expected = [".m4a", ".opus", ".webm", ".mp3", ".aac"]
+        assert extensions == expected
+    
+    def test_expected_extensions_video(self):
+        """Test expected extensions for video formats."""
+        mp4_extensions = download.expected_extensions("mp4")
+        mkv_extensions = download.expected_extensions("mkv")
+        
+        # Both should return the same list for video formats
+        expected = [".mp4", ".mkv", ".webm", ".avi"]
+        assert mp4_extensions == expected
+        assert mkv_extensions == expected
+    
+    def test_expected_extensions_custom(self):
+        """Test expected extensions for custom format."""
+        extensions = download.expected_extensions("flac")
+        assert extensions == [".flac"]
+
+
+class TestOptimizedCopyFromArchive:
+    """Test the optimized copy from archive functionality."""
+    
+    def setup_method(self):
+        """Setup for each test method."""
+        self.temp_dir = Path(tempfile.mkdtemp())
+    
+    def teardown_method(self):
+        """Cleanup after each test method."""
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir)
+    
+    def test_optimized_copy_mp3_format_enforcement(self):
+        """Test that MP3 format is enforced correctly in optimized copy."""
+        # Create a source file with .webm extension (audio)
+        source_file = self.temp_dir / "source.webm"
+        source_file.write_text("test audio content")
+        
+        # Archive entry
+        archive_entry = {
+            "file_path": str(source_file),
+            "title": "Test Song"
+        }
+        
+        # Target directory
+        target_dir = self.temp_dir / "target"
+        target_dir.mkdir()
+        
+        # Copy with MP3 container - should enforce .mp3 extension
+        result = download.optimized_copy_from_archive(archive_entry, target_dir, "mp3")
+        
+        # Verify success and correct extension
+        assert result is True
+        target_file = target_dir / "Test Song.mp3"  # Should have .mp3 extension
+        assert target_file.exists()
+        assert target_file.read_text() == "test audio content"
+    
+    def test_optimized_copy_native_format_preservation(self):
+        """Test that native format preserves original extension."""
+        # Create a source file with .opus extension
+        source_file = self.temp_dir / "source.opus"
+        source_file.write_text("test audio content")
+        
+        # Archive entry
+        archive_entry = {
+            "file_path": str(source_file),
+            "title": "Test Song"
+        }
+        
+        # Target directory
+        target_dir = self.temp_dir / "target"
+        target_dir.mkdir()
+        
+        # Copy with native container - should preserve .opus extension
+        result = download.optimized_copy_from_archive(archive_entry, target_dir, "native")
+        
+        # Verify success and preserved extension
+        assert result is True
+        target_file = target_dir / "Test Song.opus"  # Should preserve .opus
+        assert target_file.exists()
+        assert target_file.read_text() == "test audio content"
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

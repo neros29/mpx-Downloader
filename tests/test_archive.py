@@ -14,7 +14,7 @@ import download
 
 
 class TestArchiveFunctions:
-    """Test archive-related functionality."""
+    """Test archive-related functionality using ArchiveManager."""
     
     def setup_method(self):
         """Setup for each test method."""
@@ -27,15 +27,16 @@ class TestArchiveFunctions:
             shutil.rmtree(self.temp_dir)
     
     @patch('download.get_appdata_archive_path')
-    def test_load_archive_empty(self, mock_path):
-        """Test loading an empty/non-existent archive."""
+    def test_archive_manager_empty(self, mock_path):
+        """Test ArchiveManager with empty/non-existent archive."""
         mock_path.return_value = self.archive_file
-        archive = download.load_archive()
-        assert archive == {}
+        archive_mgr = download.ArchiveManager()
+        assert archive_mgr.data == {}
+        assert not archive_mgr._dirty
     
     @patch('download.get_appdata_archive_path')
-    def test_load_archive_existing(self, mock_path):
-        """Test loading an existing archive."""
+    def test_archive_manager_existing(self, mock_path):
+        """Test ArchiveManager loading existing archive."""
         mock_path.return_value = self.archive_file
         
         # Create test archive data
@@ -54,66 +55,74 @@ class TestArchiveFunctions:
         with self.archive_file.open('w', encoding='utf-8') as f:
             json.dump(test_data, f)
         
-        archive = download.load_archive()
-        assert archive == test_data
+        archive_mgr = download.ArchiveManager()
+        assert archive_mgr.data == test_data
+        assert not archive_mgr._dirty
     
     @patch('download.get_appdata_archive_path')
-    def test_save_archive(self, mock_path):
-        """Test saving archive data."""
+    def test_archive_manager_save(self, mock_path):
+        """Test ArchiveManager saving functionality."""
         mock_path.return_value = self.archive_file
         
+        archive_mgr = download.ArchiveManager()
         test_data = {
             "test_key": {
                 "id": "test123",
                 "title": "Test Title"
             }
         }
+        archive_mgr.data = test_data
+        archive_mgr._dirty = True
         
-        download.save_archive(test_data)
+        archive_mgr.save()
         
         # Verify the file was created and contains correct data
         assert self.archive_file.exists()
         with self.archive_file.open('r', encoding='utf-8') as f:
             saved_data = json.load(f)
         assert saved_data == test_data
+        assert not archive_mgr._dirty
     
     @patch('download.get_appdata_archive_path')
-    def test_add_to_archive(self, mock_path):
-        """Test adding entries to archive."""
+    def test_archive_manager_add(self, mock_path):
+        """Test adding entries to ArchiveManager."""
         mock_path.return_value = self.archive_file
         
         # Create a test file
         test_file = self.temp_dir / "test.mp3"
         test_file.touch()
         
-        download.add_to_archive("abc123", "youtube", "Test Video", test_file, "mp3")
+        archive_mgr = download.ArchiveManager()
+        archive_mgr.add("abc123", "youtube", "Test Video", test_file, "mp3")
         
         # Verify the entry was added
-        archive = download.load_archive()
         key = "youtube_abc123_mp3"
-        assert key in archive
-        assert archive[key]["id"] == "abc123"
-        assert archive[key]["title"] == "Test Video"
-        assert archive[key]["format"] == "mp3"
+        assert key in archive_mgr.data
+        assert archive_mgr.data[key]["id"] == "abc123"
+        assert archive_mgr.data[key]["title"] == "Test Video"
+        assert archive_mgr.data[key]["format"] == "mp3"
+        assert archive_mgr._dirty
     
     @patch('download.get_appdata_archive_path')
-    def test_find_in_archive_existing(self, mock_path):
-        """Test finding existing entry in archive."""
+    def test_archive_manager_find_existing(self, mock_path):
+        """Test finding existing entry in ArchiveManager."""
         mock_path.return_value = self.archive_file
         
         # Create test file and add to archive
         test_file = self.temp_dir / "test.mp3"
         test_file.touch()
-        download.add_to_archive("abc123", "youtube", "Test Video", test_file, "mp3")
+        
+        archive_mgr = download.ArchiveManager()
+        archive_mgr.add("abc123", "youtube", "Test Video", test_file, "mp3")
         
         # Find the entry
-        entry = download.find_in_archive("abc123", "youtube", "mp3")
+        entry = archive_mgr.find("abc123", "youtube", "mp3")
         assert entry is not None
         assert entry["id"] == "abc123"
         assert entry["title"] == "Test Video"
     
     @patch('download.get_appdata_archive_path')
-    def test_find_in_archive_missing_file(self, mock_path):
+    def test_archive_manager_find_missing_file(self, mock_path):
         """Test finding entry with missing file (should be removed)."""
         mock_path.return_value = self.archive_file
         
@@ -128,15 +137,70 @@ class TestArchiveFunctions:
                 "download_date": 1234567890.0
             }
         }
-        download.save_archive(test_data)
+        
+        with self.archive_file.open('w', encoding='utf-8') as f:
+            json.dump(test_data, f)
+        
+        archive_mgr = download.ArchiveManager()
         
         # Try to find the entry (should return None and remove from archive)
-        entry = download.find_in_archive("abc123", "youtube", "mp3")
+        entry = archive_mgr.find("abc123", "youtube", "mp3")
         assert entry is None
         
         # Verify entry was removed from archive
-        archive = download.load_archive()
-        assert "youtube_abc123_mp3" not in archive
+        assert "youtube_abc123_mp3" not in archive_mgr.data
+        assert archive_mgr._dirty
+
+    @patch('download.get_appdata_archive_path')
+    def test_archive_manager_extractor_normalization(self, mock_path):
+        """Test that extractor names are normalized consistently."""
+        mock_path.return_value = self.archive_file
+        
+        # Create test file
+        test_file = self.temp_dir / "test.mp3"
+        test_file.touch()
+        
+        archive_mgr = download.ArchiveManager()
+        
+        # Add entry with different extractor variations
+        archive_mgr.add("abc123", "YouTube", "Test Video", test_file, "mp3")
+        
+        # Should be able to find with different case variations
+        entry1 = archive_mgr.find("abc123", "youtube", "mp3")
+        entry2 = archive_mgr.find("abc123", "YOUTUBE", "mp3")
+        entry3 = archive_mgr.find("abc123", "Youtube", "mp3")
+        
+        assert entry1 is not None
+        assert entry2 is not None  
+        assert entry3 is not None
+        assert entry1["id"] == "abc123"
+        assert entry2["id"] == "abc123"
+        assert entry3["id"] == "abc123"
+
+    @patch('download.get_appdata_archive_path')
+    def test_archive_manager_youtube_tab_extractor(self, mock_path):
+        """Test that youtube:tab and youtubetab extractors are normalized to youtube."""
+        mock_path.return_value = self.archive_file
+        
+        # Create test file
+        test_file = self.temp_dir / "test.mp3"
+        test_file.touch()
+        
+        archive_mgr = download.ArchiveManager()
+        
+        # Add entry with youtube:tab extractor (common for playlists)
+        archive_mgr.add("abc123", "youtube:tab", "Test Video", test_file, "mp3")
+        
+        # Should be able to find with regular youtube extractor
+        entry = archive_mgr.find("abc123", "youtube", "mp3")
+        assert entry is not None
+        assert entry["id"] == "abc123"
+        
+        # Test with youtubetab as well
+        archive_mgr.add("def456", "youtubetab", "Test Video 2", test_file, "mp3")
+        entry2 = archive_mgr.find("def456", "youtube", "mp3")
+        assert entry2 is not None
+        assert entry2["id"] == "def456"
 
 
 class TestUtilityFunctions:
