@@ -1,10 +1,29 @@
 # 🎵 Interactive yt-dlp Wrapper
 
-An advanced, user-friendly wrapper for yt-dlp with smart features for downloading audio and video content from YouTube and other platforms.
+An advanced, user-friendly wrapper for yt```bash
+# Download audio only
+python3 download.py --format mp3 "https://youtube.com/watch?v=..."
+
+# Download video with best seeking (MKV)
+python3 download.py --format mkv --outdir ./videos "https://youtube.com/playlist?list=..."
+
+# Use Firefox cookies for private playlists
+python3 download.py --firefox-cookies --format mp3 "https://music.youtube.com/playlist?list=LM"
+
+# Load URLs from file
+python3 download.py --file urls.txt --format mkv
+
+# Add existing files to archive
+python3 download.py --load ./my_music_folder
+
+# Cross-platform batch download
+chmod +x examples/batch_download.sh
+./examples/batch_download.sh mp3 ~/Downloads
+```features for downloading audio and video content from YouTube and other platforms.
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)
 
 ## ✨ Features
 
@@ -13,7 +32,7 @@ An advanced, user-friendly wrapper for yt-dlp with smart features for downloadin
 - **🎵 Multiple Formats**: Download as MP3 (audio), MKV (best seeking), or MP4 (max compatibility)
 - **🍪 Cookie Support**: Automatic Firefox cookie detection for private playlists (YouTube Music Liked Songs)
 - **📂 Playlist Management**: Generates M3U playlists and handles playlist updates efficiently
-- **🔧 Windows Optimized**: Safe filenames, robust error handling, and AppData archive storage
+- **🔧 Cross-Platform**: Works on Linux, macOS, and Windows with proper path handling
 - **⚡ VLC Optimized**: Enhanced seeking performance for video files
 - **📊 Progress Tracking**: Real-time download progress with speed indicators
 
@@ -23,10 +42,10 @@ An advanced, user-friendly wrapper for yt-dlp with smart features for downloadin
 
 1. **Python 3.8+**
 2. **yt-dlp**: `pip install -U yt-dlp`
-3. **FFmpeg**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) or install via winget:
-   ```bash
-   winget install Gyan.FFmpeg
-   ```
+3. **FFmpeg**: 
+   - **Linux**: `sudo apt install ffmpeg` (Ubuntu/Debian) or `sudo yum install ffmpeg` (CentOS/RHEL)
+   - **macOS**: `brew install ffmpeg`
+   - **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) or `winget install Gyan.FFmpeg`
 
 ### Installation
 
@@ -38,11 +57,23 @@ An advanced, user-friendly wrapper for yt-dlp with smart features for downloadin
 
 2. Install dependencies:
    ```bash
+   # Linux/macOS
+   pip3 install -r requirements.txt
+   
+   # Or use the setup script
+   chmod +x setup.sh
+   ./setup.sh
+   
+   # Windows
    pip install -r requirements.txt
    ```
 
 3. Run the script:
    ```bash
+   # Linux/macOS
+   python3 download.py
+   
+   # Windows
    python download.py
    ```
 
@@ -53,6 +84,10 @@ An advanced, user-friendly wrapper for yt-dlp with smart features for downloadin
 Simply run the script and follow the prompts:
 
 ```bash
+# Linux/macOS
+python3 download.py
+
+# Windows  
 python download.py
 ```
 
@@ -134,7 +169,14 @@ https://youtube.com/watch?v=video1
 https://youtube.com/watch?v=video2
 https://youtube.com/playlist?list=playlist1
 
-# Process the file
+# Process the file (Linux/macOS)
+python3 download.py --file urls.txt --format mp3
+
+# Or use the batch script
+chmod +x examples/batch_download.sh
+./examples/batch_download.sh mp3 downloads
+
+# Windows
 python download.py --file urls.txt --format mp3
 ```
 
@@ -143,6 +185,10 @@ python download.py --file urls.txt --format mp3
 Add existing media files to the archive to prevent re-downloading:
 
 ```bash
+# Linux/macOS
+python3 download.py --load "/home/user/Music"
+
+# Windows
 python download.py --load "C:\Users\Username\Music"
 ```
 
@@ -158,7 +204,7 @@ For YouTube Music Liked Songs and other private playlists:
 
 ### Output Templates
 
-Files are saved with clean, Windows-safe filenames:
+Files are saved with clean, cross-platform safe filenames:
 - Audio: `Title.mp3`
 - Video: `Title.mkv` or `Title.mp4`
 - Playlists: `PlaylistName.m3u`
@@ -168,22 +214,29 @@ Files are saved with clean, Windows-safe filenames:
 Run the test suite to verify functionality:
 
 ```bash
-# Run all tests
+# Linux/macOS
+python3 -m pytest tests/
+# Or use the test runner
+python3 run_tests.py
+
+# Windows
 python -m pytest tests/
+python run_tests.py
 
 # Run specific test categories
-python -m pytest tests/test_archive.py
-python -m pytest tests/test_download.py
-python -m pytest tests/test_utils.py
+python3 -m pytest tests/test_archive.py
+python3 -m pytest tests/test_download.py
+python3 -m pytest tests/test_utils.py
 ```
 
 ## 📁 Project Structure
 
 ```
-yt-dlp-wrapper/
+mpx-downloader/
 ├── download.py           # Main application
 ├── requirements.txt      # Python dependencies
 ├── requirements-dev.txt  # Development dependencies
+├── setup.sh             # Cross-platform setup script
 ├── README.md            # This file
 ├── LICENSE              # MIT license
 ├── .gitignore           # Git ignore rules
@@ -195,7 +248,8 @@ yt-dlp-wrapper/
 │   └── test_utils.py
 ├── examples/            # Example configurations
 │   ├── urls.txt
-│   └── batch_download.bat
+│   ├── batch_download.sh    # Cross-platform batch script
+│   └── usage_examples.sh    # Interactive examples
 └── docs/                # Additional documentation
     ├── CONTRIBUTING.md
     └── CHANGELOG.md
@@ -210,10 +264,18 @@ We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for
 1. Clone the repository
 2. Install development dependencies:
    ```bash
+   # Linux/macOS
+   pip3 install -r requirements-dev.txt
+   
+   # Windows
    pip install -r requirements-dev.txt
    ```
 3. Run tests to ensure everything works:
    ```bash
+   # Linux/macOS
+   python3 -m pytest
+   
+   # Windows
    python -m pytest
    ```
 
@@ -239,9 +301,16 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - 💡 [Request Features](https://github.com/neros29/mpx-Downloader/issues)
 - 📖 [Documentation](https://github.com/neros29/mpx-Downloader/wiki)
 
-## 📊 Archive Location
+## Archive Location
 
 Archive files are stored in:
+
+**Linux/macOS:**
+```
+~/.local/share/yt-dlp-wrapper/download_archive.json
+```
+
+**Windows:**
 ```
 %APPDATA%\yt-dlp-wrapper\download_archive.json
 ```

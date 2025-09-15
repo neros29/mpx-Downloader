@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2024-01-XX
+## [1.0.0] - 2025-09-14
 
 ### Added
 - Initial release of Interactive yt-dlp Wrapper
@@ -18,9 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Archive management (backup, clear by name/date)
 - Directory scanning to add existing files to archive
 - VLC-optimized video settings for better seeking
-- Windows-safe filename handling
+- Cross-platform safe filename handling
 - Comprehensive test suite
 - Complete documentation and examples
+- Cross-platform shell scripts for setup and batch operations
 
 ### Features
 - **Interactive Mode**: Easy-to-use prompts for all options
@@ -36,11 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Technical Details
 - Minimum Python version: 3.8+
-- Windows-optimized with PowerShell support
+- Cross-platform support: Linux, macOS, Windows
 - Uses yt-dlp as the download engine
 - FFmpeg integration for audio/video processing
 - Colorama for cross-platform terminal colors
-- JSON-based archive storage in Windows AppData
+- JSON-based archive storage in platform-appropriate directories
 - Comprehensive error handling and logging
 - Unit tests with pytest framework
 

@@ -131,9 +131,15 @@ def build_outtmpl(base_dir: Path, is_audio: bool) -> str:
 
 
 def get_appdata_archive_path() -> Path:
-	"""Get the path to the JSON archive file in AppData."""
-	appdata = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
-	archive_dir = appdata / 'yt-dlp-wrapper'
+	"""Get the path to the JSON archive file in platform-appropriate directory."""
+	if os.name == 'nt':  # Windows
+		appdata = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
+		archive_dir = appdata / 'yt-dlp-wrapper'
+	else:  # Linux/macOS
+		# Use XDG Base Directory specification
+		xdg_data_home = os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share')
+		archive_dir = Path(xdg_data_home) / 'yt-dlp-wrapper'
+	
 	archive_dir.mkdir(parents=True, exist_ok=True)
 	return archive_dir / 'download_archive.json'
 
